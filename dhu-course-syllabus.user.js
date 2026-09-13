@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      3.1
-// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程
+// @version      3.2
+// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
@@ -115,6 +115,9 @@
         { title: '教学大纲', type: 1 },
         { title: '教学日历', type: 2 }
     ];
+    // 已选课程在学期列里只有一个“已选”标记，这里换成可直接退课的入口
+    const PLAN_ENROLLED_MARK = '已选';
+    const PLAN_DROP_TEXT = '退课';
 
     // 班次列表弹窗中的班次表格，各选课页面共用同一个 id
     const CLASS_LIST_TABLE_ID = 'accessClassTbl';
@@ -207,6 +210,35 @@
         });
     }
 
+    // 已选课程所在学期列显示“已选”，改为可点击的“退课”。
+    // 只按单元格文本判断，不依赖列结构，因此追加的两列以及“其它课程”行都不会有影响；
+    // 替换后单元格文本变为“退课”，重复执行不会叠加链接
+    function enhanceEnrolledMarks(table) {
+        table.querySelectorAll('tbody tr').forEach(row => {
+            const cells = row.querySelectorAll('td');
+            // 课程编号、课程名称固定在分类列之后，与是否已追加操作列无关
+            if (cells.length < 3) return;
+
+            const courseCode = cells[1].textContent.trim();
+            const courseName = cells[2].textContent.trim();
+            if (!/^\d+$/.test(courseCode) || !courseName) return;
+
+            Array.from(cells).forEach(cell => {
+                if (cell.textContent.trim() !== PLAN_ENROLLED_MARK) return;
+
+                cell.textContent = '';
+                const link = document.createElement('a');
+                link.textContent = PLAN_DROP_TEXT;
+                link.title = '点击退掉该课程';
+                link.style.cursor = 'pointer';
+                link.style.color = '#0066cc';
+                link.style.textDecoration = 'none';
+                link.addEventListener('click', () => dropEnrolledCourse(courseCode, courseName, link));
+                cell.appendChild(link);
+            });
+        });
+    }
+
     // 单元格默认左对齐，此处统一居中
     function addPlanTableStyle() {
         if (document.getElementById('planTableStyle')) return;
@@ -253,6 +285,7 @@
             enhancePlanCourseRow(cells, courseCode, courseName);
         });
 
+        enhanceEnrolledMarks(table);
         syncPlanRowColspans(table);
     }
 
@@ -341,6 +374,8 @@
     // 其它课程数量为 0 时不显示按钮，因此需要在页面加载时先查询一次数量；
     // 查询只做一次，失败时允许后续重试
     let otherCoursesState = 'idle';
+    // 展开状态下其它课程行需要重绘，由 buildOtherCoursesToggle 写入
+    let refreshOtherCoursesSection = () => {};
 
     function queryOtherCourses(onSuccess, onError) {
         $.ajax({
@@ -442,6 +477,13 @@
             if (expandedRows.length > 0) collapse();
             else expand();
         });
+
+        // 退课会改变其它课程的构成，展开状态下需要重新查询并重绘，折叠时下次展开本来就会重新查询
+        refreshOtherCoursesSection = () => {
+            if (loading || expandedRows.length === 0) return;
+            collapse();
+            expand();
+        };
 
         table.parentNode.insertBefore(bar, table.nextSibling);
     }
@@ -896,6 +938,51 @@
                 data: { courseCode: courseCode, classNo: classNo, cancelType: 1 },
                 success: result => resolve(result || { success: false, msg: '退课未返回结果' }),
                 error: () => resolve({ success: false, msg: '退课请求失败，请刷新页面后重试' })
+            });
+        });
+    }
+
+    // 培养计划页面上的“退课”：培养计划表格里没有班次信息，
+    // 需要先按课程编号到本学期已选课程里查到班次号，再走与 toSSC 删除按钮相同的接口。
+    // 退课会释放名额且可能被他人占用，因此先让用户确认
+    function dropEnrolledCourse(courseCode, courseName, link) {
+        if (!confirm('确认退掉“' + courseName + '”吗？\r\r退课后该班次的名额会被释放，可能被他人占用，需要重新选课才能恢复。')) {
+            return;
+        }
+
+        link.textContent = '退课中...';
+        link.style.color = '#999';
+        link.style.pointerEvents = 'none';
+
+        const restore = message => {
+            if (message) alert(message);
+            link.textContent = PLAN_DROP_TEXT;
+            link.style.color = '#0066cc';
+            link.style.pointerEvents = '';
+        };
+
+        loadSelectedCourses().then(courses => {
+            if (!courses) {
+                restore('无法获取本学期选课记录，请刷新页面后重试。');
+                return;
+            }
+
+            const enrolled = courses.find(course => String(course.courseCode) === String(courseCode));
+            if (!enrolled) {
+                restore('未找到该课程的选课记录，可能已经退课，请刷新页面后重试。');
+                return;
+            }
+
+            dropSelectedSection(courseCode, enrolled.classNo).then(result => {
+                if (!result.success) {
+                    restore('退课失败：' + (result.msg || '未知错误'));
+                    return;
+                }
+
+                alert('退课成功！');
+                // 培养计划表格不会自行更新，这里就地清掉该课程所在学期列的“已选”
+                link.parentNode.textContent = '';
+                refreshOtherCoursesSection();
             });
         });
     }
