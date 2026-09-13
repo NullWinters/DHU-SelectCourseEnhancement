@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      2.13
-// @description  1. 点击课程名称可查看教学大纲 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问
+// @version      2.14
+// @description  1. 点击课程名称可查看教学大纲 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问 7. 简化文化素质类课程数量提示
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
@@ -148,6 +148,38 @@
         links.forEach(link => link.remove());
     }
 
+    // 简化 toSCC 页面顶部的课程数量提示
+    // 原页面会写“共有 N 门课，大英类同一级别不重复计算学分！…”，说明文字随年级在 #elesyq
+    // （2024 级及以前）与 #elesyh（2025 级及以后）之间切换，两者都移除，只保留“共有 N 门课”，
+    // 并让它另起一行居中显示
+    function simplifySccNotice() {
+        if (!sitePath().startsWith('/dhu/selectcourse/toSCC')) return;
+
+        // #courseCnt 由页面的 initCourses() 反复改写，但只改文本，不会重建外层结构，
+        // 因此这里的调整只需做一次
+        const courseCnt = document.getElementById('courseCnt');
+        const countSpan = courseCnt && courseCnt.parentElement;
+        if (!countSpan || countSpan.dataset.simplified === 'true') return;
+
+        document.getElementById('elesyq')?.remove();
+        document.getElementById('elesyh')?.remove();
+
+        // 去掉数量后面残留的“，”
+        countSpan.childNodes.forEach(node => {
+            if (node.nodeType === Node.TEXT_NODE) {
+                node.textContent = node.textContent.replace(/，/g, '');
+            }
+        });
+
+        // 外层 div 已是 text-align:center，换行后两行各自居中；
+        // 行内元素不接受垂直外边距，故将数量行改为 inline-block 以便与上一行拉开间距
+        countSpan.parentElement.insertBefore(document.createElement('br'), countSpan);
+        countSpan.style.display = 'inline-block';
+        countSpan.style.marginTop = '8px';
+
+        countSpan.dataset.simplified = 'true';
+    }
+
     // 删除荣誉课程表格
     // 该汇总表块由选课页面的 selecthome.js 追加到 #tsCoursesTbl 中，其首个单元格固定为“荣誉课程”；
     // 限定在该表格内精确匹配，避免误删其他页面中名称含“荣誉课程”字样的普通课程
@@ -168,6 +200,7 @@
         addCourseNameClickEvents();
         removeNoticeButton();
         removeHonorsCourses();
+        simplifySccNotice();
 
         // 监听DOM变化（处理动态加载内容）
         const observer = new MutationObserver((mutations) => {
@@ -175,6 +208,7 @@
                 if (mutation.addedNodes.length > 0) {
                     addCourseNameClickEvents();
                     removeHonorsCourses();
+                    simplifySccNotice();
                 }
             });
         });
