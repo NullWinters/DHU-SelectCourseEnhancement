@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      2.16
-// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问 7. 简化文化素质类课程数量提示
+// @version      3.0
+// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
@@ -292,8 +292,10 @@
     // 初始化
     function init() {
         addModal();
+        addSwapCourseModal();
         defineShowCourseProp();
         addClassListTableStyle();
+        installSubmitWatcher();
         removeNoticeButton();
         removeHonorsCourses();
         enhancePlanCourseTable();
@@ -544,6 +546,325 @@
         pageWindow.selectScopeEnhanced = true;
     }
 
+    // 换课：课程已选时，可直接在班次列表里切到其他班次。
+    // 选课接口对已选课程会直接拒绝，需要先退掉当前班次再重新选课；
+    // 若新班次名额已被占用导致选课失败，则按原样把原班次选回来
+
+    // 冲突提示可能让用户等待、提交也可能迟迟不返回，靠这个延时兜底确认课程的最终状态
+    const SWAP_SETTLE_DELAY = 20000;
+
+    // initSelCourses 返回本学期已选课程，其中 jxbdm 即当前已选班次的选课序号。
+    // 学生可能在别处退课，这里每次都重新查询，不做缓存
+    let originalSelectSubmitRef = null;
+
+    function loadSelectedCourses() {
+        return new Promise(resolve => {
+            $.ajax({
+                url: contextPath + '/selectcourse/initSelCourses',
+                type: 'POST',
+                dataType: 'json',
+                success: result => {
+                    resolve(result && result.success ? (result.enrollCourses || []) : null);
+                },
+                error: () => resolve(null)
+            });
+        });
+    }
+
+    // 选课提交的参数由页面各自拼装（是否选教材、验证码、学科基础等各不相同），
+    // 换课失败后要按同样的参数重选原班次，故包裹 $.ajax 截获一次 scSubmit 调用
+    let submitWatcher = null;
+
+    function installSubmitWatcher() {
+        if (!$.ajax || $.ajax.watchScSubmit) return;
+
+        const originalAjax = $.ajax;
+        const wrappedAjax = function(options) {
+            const url = options && typeof options.url === 'string' ? options.url : '';
+            if (!submitWatcher || url.indexOf('/selectcourse/scSubmit') === -1) {
+                return originalAjax.apply(this, arguments);
+            }
+
+            // 先让页面自己的成功/失败回调跑完（其中的弹窗会阻塞），再把结果交给换课逻辑
+            const watcher = submitWatcher;
+            const originalSuccess = options.success;
+            const originalError = options.error;
+
+            return originalAjax.call(this, $.extend({}, options, {
+                success: function(result) {
+                    if (originalSuccess) originalSuccess.apply(this, arguments);
+                    watcher(options.data, result);
+                },
+                error: function() {
+                    if (originalError) originalError.apply(this, arguments);
+                    watcher(options.data, null);
+                }
+            }));
+        };
+
+        wrappedAjax.watchScSubmit = true;
+        $.ajax = wrappedAjax;
+    }
+
+    // 班次列表弹窗本身的 z-index 是 10050，换课确认弹窗必须更高才能盖住它
+    function addSwapCourseModal() {
+        if (document.getElementById('swapCourseFld')) return;
+
+        document.body.insertAdjacentHTML('beforeend', `
+        <div id="swapCourseFld"
+             style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background-color:rgba(0,0,0,0.45);z-index:10080 !important;">
+            <div style="width:520px;margin:12% auto 0;padding:16px 20px 14px;background-color:#fff;border:1px solid #4d90fe;">
+                <div style="margin-bottom:10px;font-size:16px;font-weight:bold;">换课确认</div>
+                <div id="swapCourseMsg" style="font-size:14px;line-height:22px;color:#333;"></div>
+                <div style="margin-top:18px;text-align:right;">
+                    <button type="button" class="btn" id="swapCourseCancel">取消</button>
+                    <button type="button" class="btn" id="swapCourseOk"
+                            style="margin-left:8px;background-color:#e50112;color:#fff;">确认换课</button>
+                </div>
+            </div>
+        </div>`);
+    }
+
+    // 退课后新班次可能已被占满，这一风险必须先告知用户
+    function confirmSwapCourse(courseCode, enrolled) {
+        return new Promise(resolve => {
+            const section = [
+                '选课序号 ' + enrolled.jxbdm,
+                enrolled.classNo ? '班次 ' + enrolled.classNo : '',
+                enrolled.teachName,
+                enrolled.classTime1,
+                enrolled.classRoom1
+            ].filter(Boolean).join('　');
+
+            document.getElementById('swapCourseMsg').innerHTML =
+                '<p style="margin:0 0 10px;">课程 <b>' + enrolled.courseName + '</b>（' + courseCode +
+                '）已经选上，换课会<b>先退掉当前班次</b>再选择新班次：</p>' +
+                '<p style="margin:0 0 10px;color:#31708f;">当前班次：' + section + '</p>' +
+                '<p style="margin:0;color:#e50112;">若新班次名额在此期间已被他人占用，退课后将无法选中。' +
+                '脚本会自动尝试重新选回原班次，但不保证一定成功，是否继续？</p>';
+
+            const field = document.getElementById('swapCourseFld');
+            const okButton = document.getElementById('swapCourseOk');
+            const cancelButton = document.getElementById('swapCourseCancel');
+
+            const finish = confirmed => {
+                okButton.removeEventListener('click', onOk);
+                cancelButton.removeEventListener('click', onCancel);
+                field.style.display = 'none';
+                resolve(confirmed);
+            };
+            const onOk = () => finish(true);
+            const onCancel = () => finish(false);
+
+            okButton.addEventListener('click', onOk);
+            cancelButton.addEventListener('click', onCancel);
+            field.style.display = '';
+        });
+    }
+
+    // 后续提交都由脚本驱动，不再走页面原有流程，故先自己确认一次冲突
+    function checkCourseConflict(cttId) {
+        return new Promise(resolve => {
+            $.ajax({
+                url: contextPath + '/selectcourse/scConflictCheck',
+                type: 'POST',
+                dataType: 'json',
+                data: { cttId: cttId },
+                success: result => resolve(result || {}),
+                error: () => resolve({})
+            });
+        });
+    }
+
+    // 退掉当前已选班次，与 toSSC 页面“删除”按钮使用同一接口
+    function dropSelectedSection(courseCode, classNo) {
+        return new Promise(resolve => {
+            $.ajax({
+                url: contextPath + '/selectcourse/cancelSC',
+                type: 'POST',
+                dataType: 'json',
+                data: { courseCode: courseCode, classNo: classNo, cancelType: 1 },
+                success: result => resolve(result || { success: false, msg: '退课未返回结果' }),
+                error: () => resolve({ success: false, msg: '退课请求失败，请刷新页面后重试' })
+            });
+        });
+    }
+
+    // 验证码只是形式上的校验，任意四位字符都能通过，所以不需要打断用户
+    const CAPTCHA_PLACEHOLDER = '0000';
+
+    function isCaptchaRequired(result) {
+        return !!(result && result.success && 'F' === result.msg);
+    }
+
+    // 页面收到 'F' 后会把验证码输入框插入到“确认”单元格之前，填入占位值重试即可
+    function fillCaptchaPlaceholder(aNode) {
+        const input = $(aNode).parent().find('.capvalid .capCode');
+        if (!input.length) return false;
+        input.val(CAPTCHA_PLACEHOLDER);
+        return true;
+    }
+
+    // 新班次没选上时把原班次选回来：
+    // 已经提交过一次的话，页面可能已重建班次列表，只能沿用刚才的提交参数；
+    // 否则班次列表还是原样，交给页面自己的提交逻辑去拼装参数
+    function restoreOriginalSection(aNode, enrolled, requestData, doSubmit) {
+        const report = restored => {
+            alert(restored
+                ? '换课失败，已自动重新选回原班次（选课序号 ' + enrolled.jxbdm + '）。'
+                : '换课失败，且未能重新选回原班次，请立即手动重新选课！');
+
+            // 页面上的课程列表还停留在退课后的状态，重新拉取一次
+            const refreshCourses = pageWindow.initCourses || pageWindow.initOrgnCourse;
+            if (restored && typeof refreshCourses === 'function') {
+                refreshCourses.call(pageWindow);
+            }
+        };
+
+        if (!requestData && aNode && document.body.contains(aNode) && typeof doSubmit === 'function') {
+            submitNewSection(aNode, enrolled.jxbdm, doSubmit, false).then(({ result }) => {
+                report(result && result.success && !isCaptchaRequired(result));
+            });
+            return;
+        }
+
+        const baseData = requestData && typeof requestData === 'object'
+            ? $.extend({}, requestData, { cttId: enrolled.jxbdm })
+            : { cttId: enrolled.jxbdm, needMaterial: false, capCode: '' };
+
+        const attempt = capCode => $.ajax({
+            url: contextPath + '/selectcourse/scSubmit',
+            type: 'POST',
+            dataType: 'json',
+            data: $.extend({}, baseData, { capCode: capCode }),
+            success: result => {
+                if (isCaptchaRequired(result) && capCode !== CAPTCHA_PLACEHOLDER) {
+                    attempt(CAPTCHA_PLACEHOLDER);
+                    return;
+                }
+                report(result && result.success && !isCaptchaRequired(result));
+            },
+            error: () => alert('换课失败，且重新选回原班次的请求异常，请立即手动重新选课！')
+        });
+
+        attempt(baseData.capCode);
+    }
+
+    function submitNewSection(aNode, cttId, doSubmit, allowCaptchaRetry = true) {
+        return new Promise(resolve => {
+            let handled = false;
+            const finish = (requestData, submitResult) => {
+                if (handled) return;
+                handled = true;
+                submitWatcher = null;
+                resolve({ requestData: requestData, result: submitResult });
+            };
+
+            submitWatcher = finish;
+
+            // doSelectSubmit 内部的参数拼装各页面不同（是否选教材、验证码、学科基础等），
+            // 优先复用页面自己的实现，取不到时退回页面原有的 selectSubmit
+            const submit = typeof doSubmit === 'function' ? doSubmit : originalSelectSubmitRef;
+            submit.call(pageWindow, aNode, cttId);
+
+            // 页面流程也可能根本没有提交，交由调用方核对课程最终状态
+            setTimeout(() => {
+                if (handled) return;
+                handled = true;
+                submitWatcher = null;
+                resolve({ requestData: null, result: null });
+            }, SWAP_SETTLE_DELAY);
+        }).then(outcome => {
+            if (!allowCaptchaRetry || !isCaptchaRequired(outcome.result) || !fillCaptchaPlaceholder(aNode)) {
+                return outcome;
+            }
+            return submitNewSection(aNode, cttId, doSubmit, false);
+        });
+    }
+
+    // 换课前后都可能有选课冲突提示，此时课程还没退，用户放弃也没有损失
+    function confirmConflictWarning(conflictResult) {
+        if (!conflictResult || conflictResult.success) return Promise.resolve(true);
+        return Promise.resolve(confirm(
+            (conflictResult.msg || '选课有冲突') + '\r\r选课有冲突，请确认是否继续提交'
+        ));
+    }
+
+    function swapCourseSection(aNode, cttId, enrolled, courseCode, doSubmit) {
+        confirmSwapCourse(courseCode, enrolled).then(confirmed => {
+            if (!confirmed) return;
+
+            checkCourseConflict(cttId).then(conflictResult => {
+                confirmConflictWarning(conflictResult).then(proceed => {
+                    if (!proceed) return;
+
+                    dropSelectedSection(courseCode, enrolled.classNo).then(dropResult => {
+                        if (!dropResult.success) {
+                            alert('退课失败：' + (dropResult.msg || '未知错误') + '，已取消换课。');
+                            return;
+                        }
+
+                        submitNewSection(aNode, cttId, doSubmit).then(({ requestData, result }) => {
+                            if (result && result.success && !isCaptchaRequired(result)) return;
+
+                            loadSelectedCourses().then(courses => {
+                                // 提交没走通，但课程可能还在（例如页面根本没有发起提交）
+                                const stillSelected = (courses || []).some(
+                                    course => String(course.courseCode) === String(courseCode)
+                                );
+                                if (stillSelected) return;
+
+                                restoreOriginalSection(aNode, enrolled, requestData, doSubmit);
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    }
+
+    // 班次列表弹窗在打开时会写入课程编号：#curCourseCode 由各页面共用，
+    // #opeCr 在部分页面保存同一个值
+    function currentClassListCourseCode() {
+        const candidates = [$('#opeCr').val(), $('#curCourseCode').text()];
+        return candidates
+            .map(value => String(value == null ? '' : value).trim())
+            .find(value => /^\d+$/.test(value)) || null;
+    }
+
+    // 增强 selectSubmit：课程已选时先退课再选课，未选时保持原有流程
+    function enhanceSelectSubmit() {
+        if (!pageWindow.selectSubmit || pageWindow.selectSubmitEnhanced) return;
+
+        const originalSelectSubmit = pageWindow.selectSubmit;
+        originalSelectSubmitRef = originalSelectSubmit;
+
+        pageWindow.selectSubmit = function(aNode, cttId) {
+            const courseCode = currentClassListCourseCode();
+
+            loadSelectedCourses().then(courses => {
+                const enrolled = courseCode
+                    ? (courses || []).find(course => String(course.courseCode) === String(courseCode))
+                    : null;
+
+                if (!enrolled) {
+                    originalSelectSubmit.call(pageWindow, aNode, cttId);
+                    return;
+                }
+
+                if (String(enrolled.jxbdm) === String(cttId)) {
+                    alert('该班次就是当前已选班次，无需换课。');
+                    return;
+                }
+
+                // 各页面的提交函数都叫 doSelectSubmit，用它可复用各自的参数拼装
+                swapCourseSection(aNode, cttId, enrolled, courseCode, pageWindow.doSelectSubmit);
+            });
+        };
+
+        pageWindow.selectSubmitEnhanced = true;
+    }
+
     // 增强 initOrgnCourse：后端的 initSCByOrgn 只接受单个学院 ID，
     // “全校”选项（id=61）不会返回任何课程，因此在前端遍历下拉框中所有学院并合并渲染
     const ALL_SCHOOL_ORGN_ID = '61';
@@ -697,10 +1018,14 @@
             if (pageWindow.selectScope && !pageWindow.selectScopeEnhanced) {
                 enhanceSelectScope();
             }
+            if (pageWindow.selectSubmit && !pageWindow.selectSubmitEnhanced) {
+                enhanceSelectSubmit();
+            }
             if (pageWindow.initOrgnCourse && !pageWindow.initOrgnCourseEnhanced) {
                 enhanceInitOrgnCourse();
             }
-            if (!pageWindow.showScmTblEnhanced || !pageWindow.selectScopeEnhanced) {
+            if (!pageWindow.showScmTblEnhanced || !pageWindow.selectScopeEnhanced ||
+                (pageWindow.selectSubmit && !pageWindow.selectSubmitEnhanced)) {
                 setTimeout(tryEnhance, 200);
             }
         };
