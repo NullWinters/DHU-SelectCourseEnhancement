@@ -1,19 +1,15 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      3.3
-// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课 11. 培养计划页面底部追加超星学习通自选课程入口
+// @version      3.4
+// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webproxy 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课 11. 培养计划页面底部追加超星学习通自选课程入口
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSelectByOrgn*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toOEC*
 // @match        https://jwgl.dhu.edu.cn/dhu/studenthome.jsp*
-// @match        https://webproxy.dhu.edu.cn/https/*/dhu/selectcourse/toSH*
-// @match        https://webproxy.dhu.edu.cn/https/*/dhu/selectcourse/toSCC*
-// @match        https://webproxy.dhu.edu.cn/https/*/dhu/selectcourse/toSelectByOrgn*
-// @match        https://webproxy.dhu.edu.cn/https/*/dhu/selectcourse/toOEC*
-// @match        https://webproxy.dhu.edu.cn/https/*/dhu/studenthome.jsp*
+// @include      /^https:\/\/(?:webproxy|webvpn)\.dhu\.edu\.cn\/(?:https\/[^\/]+\/)?dhu\/(?:selectcourse\/(?:toSH|toSCC|toSelectByOrgn|toOEC)|studenthome\.jsp)/
 // @grant        GM_xmlhttpRequest
 // @connect      jw.dhu.edu.cn
 // @run-at       document-idle
@@ -24,22 +20,24 @@
 
     const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
-    // 校外通过 webvpn 访问时，URL 形如 https://webproxy.dhu.edu.cn/https/<token>/dhu/xxx，
-    // 代理会在页面中注入 vpn_rewrite_url，可据此判断当前是否处于代理环境
-    function isWebVpn() {
-        return typeof pageWindow.vpn_rewrite_url === 'function';
+    // 校外通过教务代理访问时，URL 形如 https://webproxy.dhu.edu.cn/https/<token>/dhu/xxx，
+    // 其中 <token> 是代理对目标站点加密后的标识，代理还会注入 vpn_rewrite_url 用于改写站外地址。
+    // 以地址中的 /https/ 前缀为主要判据，避免代理脚本晚于本脚本注入时误判为直连
+    function isProxied() {
+        return window.location.pathname.startsWith('/https/')
+            || typeof pageWindow.vpn_rewrite_url === 'function';
     }
 
-    // 取站点内路径，即去掉 webvpn 的 /https/<token> 前缀，便于与直连环境使用同一套判断
+    // 取站点内路径，即去掉代理的 /https/<token> 前缀，便于与直连环境使用同一套判断
     function sitePath() {
-        const matched = window.location.pathname.match(/\/dhu\/.*$/);
-        return matched ? matched[0] : window.location.pathname;
+        const matched = window.location.pathname.match(/^(?:\/https\/[^/]+)?(\/dhu\/.*)$/);
+        return matched ? matched[1] : window.location.pathname;
     }
 
-    // 代理环境下需调用页面内的 fetch：vpn 脚本会把站外地址改写为同源代理地址，不受跨域限制；
+    // 代理环境下需调用页面内的 fetch：代理脚本会把站外地址改写为同源代理地址，不受跨域限制；
     // 脚本沙箱中的 fetch 不会被改写，直连环境则使用 GM_xmlhttpRequest 绕过跨域
     function fetchExternalText(url, onload, onerror) {
-        if (isWebVpn()) {
+        if (isProxied()) {
             pageWindow.fetch(url).then(response => response.text()).then(onload).catch(onerror);
         } else {
             GM_xmlhttpRequest({
@@ -51,9 +49,11 @@
         }
     }
 
-    // 代理环境下站外链接无法直连，需改写为代理地址后才能访问
+    // 代理环境下站外链接无法直连，需改写为代理地址后才能访问；
+    // 代理会给链接地址挂双向改写钩子（写入代理地址会被还原为原始地址、点击时再改写），
+    // 此处改写与直接写入原始地址等价，用于兜底代理脚本尚未注入的时刻
     function toAccessibleUrl(url) {
-        if (!isWebVpn()) return url;
+        if (!isProxied()) return url;
         try {
             return pageWindow.vpn_rewrite_url(url);
         } catch (e) {

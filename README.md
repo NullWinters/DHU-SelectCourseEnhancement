@@ -10,7 +10,7 @@
 - 其他专业选修课程页面
 - 学生首页
 
-以上页面在校内直连（`jwgl.dhu.edu.cn`）和校外通过 webvpn 代理（`webproxy.dhu.edu.cn/https/<token>/...`）访问时均可生效。
+以上页面在校内直连（`jwgl.dhu.edu.cn`）和校外通过 webproxy 代理（`webproxy.dhu.edu.cn/https/<token>/...`）访问时均可生效。
 
 ## 功能列表
 
@@ -85,11 +85,12 @@
 
 自动移除学生首页上不停弹跳的"评教指南"图片（跳转 `evalHelp.jsp` 的浮动按钮），同时停止驱动它的定时器，避免无用计算。
 
-### 兼容校外 webvpn 代理访问
+### 兼容校外 webproxy 代理访问
 
-校外访问时，URL 会变为 `https://webproxy.dhu.edu.cn/https/<token>/dhu/...`。脚本已为此追加对应的匹配规则，并做如下适配：
+校外访问时，URL 会变为 `https://webproxy.dhu.edu.cn/https/<token>/dhu/...`，其中 `<token>` 是代理对目标站点加密后的标识。脚本已为此放宽匹配规则，并做如下适配：
 
-- 通过代理注入的 `vpn_rewrite_url` 判断当前是否处于代理环境，并按站点内路径（去掉 `/https/<token>` 前缀）执行原有的页面判断逻辑
+- 匹配规则同时接受 `webproxy.dhu.edu.cn` 与 `webvpn.dhu.edu.cn`（同一套代理服务的两个域名），`/https/<token>` 前缀可有可无，代理调整地址形式后无需改动脚本
+- 以地址中的 `/https/` 前缀判断代理环境（代理注入的 `vpn_rewrite_url` 仅作兜底信号，避免代理脚本晚于本脚本加载时误判为直连），并按站点内路径（去掉 `/https/<token>` 前缀）执行原有的页面判断逻辑
 - 获取选课手册时调用页面内的 `fetch`，由代理把站外地址改写为同源代理地址，避免跨域失败
 - 手册链接沿用代理环境的地址改写，保证可在新标签页中打开
 
