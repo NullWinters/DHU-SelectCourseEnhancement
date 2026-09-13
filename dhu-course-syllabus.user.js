@@ -119,6 +119,38 @@
     // 班次列表弹窗中的班次表格，各选课页面共用同一个 id
     const CLASS_LIST_TABLE_ID = 'accessClassTbl';
 
+    // 表格总列数：带跨行表头的单元格按 colspan 计入，最后一行表头单元格均为单列
+    function planTableColumnCount(table) {
+        const headerRows = table.querySelectorAll('thead tr');
+        if (headerRows.length === 0) return PLAN_TABLE_COLUMNS;
+
+        let count = 0;
+        headerRows.forEach(row => {
+            Array.from(row.children).forEach(cell => {
+                if (cell.rowSpan === headerRows.length) count += cell.colSpan;
+            });
+        });
+        return count + headerRows[headerRows.length - 1].children.length;
+    }
+
+    // 分类标题行与占位行依靠 colspan 占满整行，追加两列后原 colspan 会短两格。
+    // 表格内容会被 selecthome.js 重新渲染，且渲染顺序不固定（占位行可能在课程行之后才插入），
+    // 因此这里每次都按表头实际列数校正，不能只在首次处理课程行时顺带执行
+    function syncPlanRowColspans(table) {
+        const columnCount = planTableColumnCount(table);
+
+        table.querySelectorAll('tbody tr').forEach(row => {
+            const cells = row.querySelectorAll('td');
+            if (cells.length === 0 || cells.length >= columnCount) return;
+
+            const lastCell = cells[cells.length - 1];
+            if (!lastCell.hasAttribute('colspan')) return;
+
+            const colSpan = columnCount - cells.length + 1;
+            if (lastCell.colSpan !== colSpan) lastCell.colSpan = colSpan;
+        });
+    }
+
     // 表头由服务端渲染一次，追加两列的同时收窄课程名称与学期列，保持总宽度仍为 100%
     function enhancePlanTableHeader(table) {
         const headerRow = table.querySelector('thead tr');
@@ -207,10 +239,7 @@
         enhancePlanTableHeader(table);
 
         // 表格内容由 selecthome.js 重新渲染，故每次都要重新处理；已处理的行打标记跳过
-        const rows = Array.from(table.querySelectorAll('tbody tr'));
-        let columnCount = 0;
-
-        rows.forEach(row => {
+        table.querySelectorAll('tbody tr').forEach(row => {
             const cells = row.querySelectorAll('td');
             if (cells.length !== PLAN_TABLE_COLUMNS) return;
 
@@ -218,24 +247,13 @@
             const courseName = cells[2].textContent.trim();
             // 课程行以外还有分类标题行（colspan 跨列），以“课程编号为纯数字”区分
             if (!/^\d+$/.test(courseCode) || !courseName || /^[\d.]+$/.test(courseName)) return;
+            if (row.dataset.planCourseEnhanced === 'true') return;
 
-            if (row.dataset.planCourseEnhanced !== 'true') {
-                row.dataset.planCourseEnhanced = 'true';
-                enhancePlanCourseRow(cells, courseCode, courseName);
-            }
-            columnCount = row.querySelectorAll('td').length;
+            row.dataset.planCourseEnhanced = 'true';
+            enhancePlanCourseRow(cells, courseCode, courseName);
         });
 
-        if (columnCount === 0) return;
-
-        // 分类标题行与占位行依靠 colspan 占满整行，列数变化后需要同步
-        rows.forEach(row => {
-            const cells = row.querySelectorAll('td');
-            if (cells.length === 0 || cells.length >= columnCount) return;
-            const lastCell = cells[cells.length - 1];
-            if (!lastCell.hasAttribute('colspan')) return;
-            lastCell.colSpan = columnCount - cells.length + 1;
-        });
+        syncPlanRowColspans(table);
     }
 
     // 培养计划页面的“其它课程”区块
@@ -246,20 +264,6 @@
     // 与培养计划表格里的分类一致，其它课程归入“其它课程/选修课”
     const OTHER_COURSES_CATEGORY = '其它课程';
     const OTHER_COURSES_KIND = '选修课';
-
-    // 表格总列数：带跨行表头的单元格按 colspan 计入，最后一行表头单元格均为单列
-    function planTableColumnCount(table) {
-        const headerRows = table.querySelectorAll('thead tr');
-        if (headerRows.length === 0) return PLAN_TABLE_COLUMNS;
-
-        let count = 0;
-        headerRows.forEach(row => {
-            Array.from(row.children).forEach(cell => {
-                if (cell.rowSpan === headerRows.length) count += cell.colSpan;
-            });
-        });
-        return count + headerRows[headerRows.length - 1].children.length;
-    }
 
     // 学分与“已选/成绩”的呈现方式与成绩查询页面 coursegrade.js 的 parseYearTermOtherCourse 一致：
     // 课程所在学期由 DIFFYEAR（相对当前学期的学年偏移）与 TERM（a/s）换算而来
@@ -334,9 +338,25 @@
         return rows;
     }
 
-    // 其它课程数量为 0 时不显示按钮，因此需要在页面加载时先查询一次数量，
-    // 但表格内容仍然等到点击按钮时才渲染；查询只做一次，失败时允许后续重试
+    // 其它课程数量为 0 时不显示按钮，因此需要在页面加载时先查询一次数量；
+    // 查询只做一次，失败时允许后续重试
     let otherCoursesState = 'idle';
+
+    function queryOtherCourses(onSuccess, onError) {
+        $.ajax({
+            url: pageWindow.contextPath + '/selectcourse/initTSCourses',
+            type: 'POST',
+            dataType: 'json',
+            cache: false,
+            data: { studNo: pageWindow.studNo, scSemester: pageWindow.scSemester, type: 'selectCourse' },
+            success: result => {
+                onSuccess((result && result.success && result.otherScore) ? result.otherScore : []);
+            },
+            error: () => {
+                onError();
+            }
+        });
+    }
 
     function addOtherCoursesToggle() {
         if (!sitePath().startsWith('/dhu/selectcourse/toSH')) return;
@@ -346,27 +366,19 @@
         if (!table || !table.parentNode) return;
 
         otherCoursesState = 'loading';
-        $.ajax({
-            url: pageWindow.contextPath + '/selectcourse/initTSCourses',
-            type: 'POST',
-            dataType: 'json',
-            data: { studNo: pageWindow.studNo, scSemester: pageWindow.scSemester, type: 'selectCourse' },
-            success: result => {
-                const courses = (result && result.success && result.otherScore) ? result.otherScore : [];
-                if (courses.length === 0) {
-                    otherCoursesState = 'empty';
-                    return;
-                }
-                otherCoursesState = 'ready';
-                buildOtherCoursesToggle(table, courses);
-            },
-            error: () => {
-                otherCoursesState = 'idle';
+        queryOtherCourses(courses => {
+            if (courses.length === 0) {
+                otherCoursesState = 'empty';
+                return;
             }
+            otherCoursesState = 'ready';
+            buildOtherCoursesToggle(table);
+        }, () => {
+            otherCoursesState = 'idle';
         });
     }
 
-    function buildOtherCoursesToggle(table, courses) {
+    function buildOtherCoursesToggle(table) {
         if (document.getElementById(OTHER_COURSES_BAR_ID)) return;
 
         const bar = document.createElement('div');
@@ -381,6 +393,7 @@
         bar.appendChild(button);
 
         let expandedRows = [];
+        let loading = false;
 
         const collapse = () => {
             expandedRows.forEach(row => row.remove());
@@ -388,22 +401,44 @@
             button.textContent = '展开其它课程';
         };
 
+        // 展开期间其它课程可能被选上或退掉，缓存的列表会过期，因此每次展开都重新查询，
+        // 查询结果为空说明已经没有其它课程，此时连同按钮一起移除
         const expand = () => {
             const tbody = table.querySelector('tbody');
             if (!tbody) return;
 
-            // 表格末尾的空行只用于撑出圆角，新内容插在它之前
-            const lastRow = tbody.lastElementChild;
-            const anchor = (lastRow && lastRow.children.length === 1 && !lastRow.textContent.trim()) ? lastRow : null;
+            loading = true;
+            button.disabled = true;
+            button.textContent = '加载中...';
 
-            buildOtherCoursesRows(courses, table).forEach(row => {
-                tbody.insertBefore(row, anchor);
-                expandedRows.push(row);
+            queryOtherCourses(courses => {
+                loading = false;
+                button.disabled = false;
+
+                if (courses.length === 0) {
+                    otherCoursesState = 'empty';
+                    bar.remove();
+                    return;
+                }
+
+                // 表格末尾的空行只用于撑出圆角，新内容插在它之前
+                const lastRow = tbody.lastElementChild;
+                const anchor = (lastRow && lastRow.children.length === 1 && !lastRow.textContent.trim()) ? lastRow : null;
+
+                buildOtherCoursesRows(courses, table).forEach(row => {
+                    tbody.insertBefore(row, anchor);
+                    expandedRows.push(row);
+                });
+                button.textContent = '收起其它课程';
+            }, () => {
+                loading = false;
+                button.disabled = false;
+                button.textContent = '展开其它课程';
             });
-            button.textContent = '收起其它课程';
         };
 
         button.addEventListener('click', () => {
+            if (loading) return;
             if (expandedRows.length > 0) collapse();
             else expand();
         });
