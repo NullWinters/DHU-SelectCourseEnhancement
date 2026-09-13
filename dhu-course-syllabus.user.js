@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      3.0
-// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课
+// @version      3.1
+// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
@@ -238,6 +238,179 @@
         });
     }
 
+    // 培养计划页面的“其它课程”区块
+    // 其它课程不计入培养计划，服务端渲染的培养计划表格里没有它们。
+    // selecthome.js 的 initCourses() 会请求 initTSCourses，但只取结果中的 tsCourses，otherScore 被丢弃，
+    // 这里补一个按钮，点击后才重新请求并追加到培养计划表格末尾，避免每次打开页面都多渲染一段内容
+    const OTHER_COURSES_BAR_ID = 'otherCoursesBar';
+    // 与培养计划表格里的分类一致，其它课程归入“其它课程/选修课”
+    const OTHER_COURSES_CATEGORY = '其它课程';
+    const OTHER_COURSES_KIND = '选修课';
+
+    // 表格总列数：带跨行表头的单元格按 colspan 计入，最后一行表头单元格均为单列
+    function planTableColumnCount(table) {
+        const headerRows = table.querySelectorAll('thead tr');
+        if (headerRows.length === 0) return PLAN_TABLE_COLUMNS;
+
+        let count = 0;
+        headerRows.forEach(row => {
+            Array.from(row.children).forEach(cell => {
+                if (cell.rowSpan === headerRows.length) count += cell.colSpan;
+            });
+        });
+        return count + headerRows[headerRows.length - 1].children.length;
+    }
+
+    // 学分与“已选/成绩”的呈现方式与成绩查询页面 coursegrade.js 的 parseYearTermOtherCourse 一致：
+    // 课程所在学期由 DIFFYEAR（相对当前学期的学年偏移）与 TERM（a/s）换算而来
+    function otherCourseTermIndex(course) {
+        const diffYear = (course.DIFFYEAR == null || course.DIFFYEAR < 0) ? 0 : course.DIFFYEAR;
+        return diffYear * 2 + (course.TERM === 's' ? 2 : 1);
+    }
+
+    // 行结构与培养计划表格保持一致：分类标题行 + 课程行，
+    // 课程行沿用 enhancePlanCourseRow 处理，因此点击课程名称同样可以打开班次列表，
+    // 教学大纲、教学日历两列也可用
+    function buildOtherCoursesRows(courses, table) {
+        const headerRows = table.querySelectorAll('thead tr');
+        const termCount = headerRows[headerRows.length - 1].children.length;
+        const columnCount = planTableColumnCount(table);
+
+        const kindRow = document.createElement('tr');
+        kindRow.className = 'fbold';
+        const kindCategoryCell = document.createElement('td');
+        kindCategoryCell.textContent = OTHER_COURSES_CATEGORY;
+        kindRow.appendChild(kindCategoryCell);
+
+        const kindCell = document.createElement('td');
+        kindCell.colSpan = Math.max(1, columnCount - 1);
+        const kindSpan = document.createElement('span');
+        kindSpan.className = 'crKind';
+        kindSpan.style.fontWeight = 'bold';
+        kindSpan.textContent = OTHER_COURSES_KIND;
+        kindCell.appendChild(kindSpan);
+        kindRow.appendChild(kindCell);
+
+        const rows = [kindRow];
+
+        courses.forEach(course => {
+            const row = document.createElement('tr');
+            const cells = [];
+
+            const categoryCell = document.createElement('td');
+            categoryCell.textContent = OTHER_COURSES_CATEGORY;
+            row.appendChild(categoryCell);
+            cells.push(categoryCell);
+
+            const codeCell = document.createElement('td');
+            codeCell.textContent = course.KCBH || '';
+            row.appendChild(codeCell);
+            cells.push(codeCell);
+
+            const nameCell = document.createElement('td');
+            nameCell.textContent = course.KCMC || '';
+            row.appendChild(nameCell);
+            cells.push(nameCell);
+
+            const creditCell = document.createElement('td');
+            creditCell.textContent = course.XF ? Number(course.XF).toFixed(1) : '';
+            row.appendChild(creditCell);
+            cells.push(creditCell);
+
+            // 成绩与“已选”的呈现方式与成绩查询页面 coursegrade.js 的 parseYearTermOtherCourse 一致：
+            // 课程所在学期由 DIFFYEAR（相对当前学期的学年偏移）与 TERM（a/s）换算而来
+            const termIndex = otherCourseTermIndex(course);
+            for (let i = 1; i <= termCount; i++) {
+                const cell = document.createElement('td');
+                if (i === termIndex) cell.textContent = course.CJ || '已选';
+                row.appendChild(cell);
+            }
+
+            cells.push(...Array.from(row.children).slice(4));
+            enhancePlanCourseRow(cells, course.KCBH || '', course.KCMC || '');
+            rows.push(row);
+        });
+
+        return rows;
+    }
+
+    // 其它课程数量为 0 时不显示按钮，因此需要在页面加载时先查询一次数量，
+    // 但表格内容仍然等到点击按钮时才渲染；查询只做一次，失败时允许后续重试
+    let otherCoursesState = 'idle';
+
+    function addOtherCoursesToggle() {
+        if (!sitePath().startsWith('/dhu/selectcourse/toSH')) return;
+        if (otherCoursesState !== 'idle') return;
+
+        const table = document.getElementById(PLAN_TABLE_ID);
+        if (!table || !table.parentNode) return;
+
+        otherCoursesState = 'loading';
+        $.ajax({
+            url: pageWindow.contextPath + '/selectcourse/initTSCourses',
+            type: 'POST',
+            dataType: 'json',
+            data: { studNo: pageWindow.studNo, scSemester: pageWindow.scSemester, type: 'selectCourse' },
+            success: result => {
+                const courses = (result && result.success && result.otherScore) ? result.otherScore : [];
+                if (courses.length === 0) {
+                    otherCoursesState = 'empty';
+                    return;
+                }
+                otherCoursesState = 'ready';
+                buildOtherCoursesToggle(table, courses);
+            },
+            error: () => {
+                otherCoursesState = 'idle';
+            }
+        });
+    }
+
+    function buildOtherCoursesToggle(table, courses) {
+        if (document.getElementById(OTHER_COURSES_BAR_ID)) return;
+
+        const bar = document.createElement('div');
+        bar.id = OTHER_COURSES_BAR_ID;
+        bar.style.textAlign = 'center';
+        bar.style.marginTop = '10px';
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn blue';
+        button.textContent = '展开其它课程';
+        bar.appendChild(button);
+
+        let expandedRows = [];
+
+        const collapse = () => {
+            expandedRows.forEach(row => row.remove());
+            expandedRows = [];
+            button.textContent = '展开其它课程';
+        };
+
+        const expand = () => {
+            const tbody = table.querySelector('tbody');
+            if (!tbody) return;
+
+            // 表格末尾的空行只用于撑出圆角，新内容插在它之前
+            const lastRow = tbody.lastElementChild;
+            const anchor = (lastRow && lastRow.children.length === 1 && !lastRow.textContent.trim()) ? lastRow : null;
+
+            buildOtherCoursesRows(courses, table).forEach(row => {
+                tbody.insertBefore(row, anchor);
+                expandedRows.push(row);
+            });
+            button.textContent = '收起其它课程';
+        };
+
+        button.addEventListener('click', () => {
+            if (expandedRows.length > 0) collapse();
+            else expand();
+        });
+
+        table.parentNode.insertBefore(bar, table.nextSibling);
+    }
+
     // 删除"选课注意事项"按钮
     function removeNoticeButton() {
         const links = document.querySelectorAll('a[onclick*="showNotice"]');
@@ -299,6 +472,7 @@
         removeNoticeButton();
         removeHonorsCourses();
         enhancePlanCourseTable();
+        addOtherCoursesToggle();
         simplifySccNotice();
 
         // 监听DOM变化（处理动态加载内容）
@@ -307,6 +481,7 @@
                 if (mutation.addedNodes.length > 0) {
                     removeHonorsCourses();
                     enhancePlanCourseTable();
+                    addOtherCoursesToggle();
                     simplifySccNotice();
                 }
             });
