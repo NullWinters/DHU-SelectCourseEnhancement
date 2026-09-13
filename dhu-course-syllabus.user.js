@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      2.14
-// @description  1. 点击课程名称可查看教学大纲 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问 7. 简化文化素质类课程数量提示
+// @version      2.15
+// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问 7. 简化文化素质类课程数量提示
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
@@ -106,39 +106,122 @@
         }
     }
 
-    // 为课程名称添加点击事件
-    function addCourseNameClickEvents() {
-        const table = document.querySelector('table');
+    // 培养计划页面的课程表格：#tsCoursesTbl，课程行为
+    // 课程类别 / 课程编号 / 课程名称 / 学分 / 8 个学期列，共 12 列
+    const PLAN_TABLE_ID = 'tsCoursesTbl';
+    const PLAN_TABLE_COLUMNS = 12;
+    // 在“课程名称”列后追加的两列，type 与 pageWindow.showCourseProp(courseCode, type) 对应
+    const PLAN_ACTION_COLUMNS = [
+        { title: '教学大纲', type: 1 },
+        { title: '教学日历', type: 2 }
+    ];
+
+    // 表头由服务端渲染一次，追加两列的同时收窄课程名称与学期列，保持总宽度仍为 100%
+    function enhancePlanTableHeader(table) {
+        const headerRow = table.querySelector('thead tr');
+        if (!headerRow || headerRow.dataset.planHeaderEnhanced === 'true') return;
+
+        const nameHeader = Array.from(headerRow.children).find(th => th.textContent.trim() === '课程名称');
+        if (!nameHeader) return;
+
+        headerRow.dataset.planHeaderEnhanced = 'true';
+        nameHeader.style.width = '25%';
+        table.querySelectorAll('thead tr#yeartermPart th').forEach(th => {
+            th.style.width = '4.5%';
+        });
+
+        let previous = nameHeader;
+        PLAN_ACTION_COLUMNS.forEach(column => {
+            const th = document.createElement('th');
+            th.rowSpan = 2;
+            th.style.width = '7%';
+            th.textContent = column.title;
+            previous.parentNode.insertBefore(th, previous.nextSibling);
+            previous = th;
+        });
+    }
+
+    // 课程编号不再承担班次列表入口，仅作普通黑色文本；班次列表统一改由课程名称打开
+    function enhancePlanCourseRow(cells, courseCode, courseName) {
+        const codeCell = cells[1];
+        codeCell.textContent = courseCode;
+        codeCell.style.color = '#000';
+
+        const nameCell = cells[2];
+        nameCell.textContent = '';
+        const nameLink = document.createElement('a');
+        nameLink.textContent = courseName;
+        // selectScope 依赖链接自身取课程代码，这里直接把代码挂在链接上
+        nameLink.dataset.courseCode = courseCode;
+        nameLink.title = '点击查看班次列表';
+        nameLink.style.cursor = 'pointer';
+        nameLink.style.color = '#0066cc';
+        nameLink.style.textDecoration = 'none';
+        nameLink.addEventListener('click', () => pageWindow.selectScope(nameLink));
+        nameCell.appendChild(nameLink);
+
+        let previous = nameCell;
+        PLAN_ACTION_COLUMNS.forEach(column => {
+            const cell = document.createElement('td');
+            const link = document.createElement('a');
+            link.textContent = column.title;
+            link.addEventListener('click', () => pageWindow.showCourseProp(courseCode, column.type));
+            cell.appendChild(link);
+            previous.parentNode.insertBefore(cell, previous.nextSibling);
+            previous = cell;
+        });
+    }
+
+    // 单元格默认左对齐，此处统一居中
+    function addPlanTableStyle() {
+        if (document.getElementById('planTableStyle')) return;
+
+        const style = document.createElement('style');
+        style.id = 'planTableStyle';
+        style.textContent = `#${PLAN_TABLE_ID} th, #${PLAN_TABLE_ID} td { text-align: center; }`;
+        document.head.appendChild(style);
+    }
+
+    // 培养计划页面原本只有部分课程的“课程编号”能打开班次列表，
+    // 这里统一改为点击“课程名称”打开，并为其追加“教学大纲”“教学日历”两个按钮
+    function enhancePlanCourseTable() {
+        if (!sitePath().startsWith('/dhu/selectcourse/toSH')) return;
+
+        const table = document.getElementById(PLAN_TABLE_ID);
         if (!table) return;
 
-        const rows = table.querySelectorAll('tbody tr');
+        addPlanTableStyle();
+        enhancePlanTableHeader(table);
+
+        // 表格内容由 selecthome.js 重新渲染，故每次都要重新处理；已处理的行打标记跳过
+        const rows = Array.from(table.querySelectorAll('tbody tr'));
+        let columnCount = 0;
+
         rows.forEach(row => {
             const cells = row.querySelectorAll('td');
-            // 课程名称在第3列（索引2）
-            if (cells.length > 2) {
-                const courseNameCell = cells[2];
-                const courseCodeCell = cells[1];
+            if (cells.length !== PLAN_TABLE_COLUMNS) return;
 
-                // 检查是否已经有点击事件（通过检查是否包含链接或已标记）
-                if (!courseNameCell.querySelector('a') && !courseNameCell.dataset.courseBind && courseCodeCell.textContent.trim()) {
-                    const courseName = courseNameCell.textContent.trim();
-                    const courseCode = courseCodeCell.textContent.trim();
+            const courseCode = cells[1].textContent.trim();
+            const courseName = cells[2].textContent.trim();
+            // 课程行以外还有分类标题行（colspan 跨列），以“课程编号为纯数字”区分
+            if (!/^\d+$/.test(courseCode) || !courseName || /^[\d.]+$/.test(courseName)) return;
 
-                    // 跳过分类标题行（如"必修课"、"选修课"等）
-                    // 同时跳过纯数字单元格（学分类）：部分页面第 3 列并非课程名称
-                    if (courseName && !/^[\d.]+$/.test(courseName) && !courseName.includes('要求学分') && !courseName.includes('获得学分') && courseCode.match(/^\d+$/)) {
-                        courseNameCell.dataset.courseBind = 'true';
-                        courseNameCell.style.cursor = 'pointer';
-                        courseNameCell.style.color = '#0066cc';
-                        courseNameCell.style.textDecoration = 'underline';
-                        courseNameCell.title = '点击查看教学大纲';
-
-                        courseNameCell.addEventListener('click', function() {
-                            pageWindow.showCourseProp(courseCode, 1);
-                        });
-                    }
-                }
+            if (row.dataset.planCourseEnhanced !== 'true') {
+                row.dataset.planCourseEnhanced = 'true';
+                enhancePlanCourseRow(cells, courseCode, courseName);
             }
+            columnCount = row.querySelectorAll('td').length;
+        });
+
+        if (columnCount === 0) return;
+
+        // 分类标题行与占位行依靠 colspan 占满整行，列数变化后需要同步
+        rows.forEach(row => {
+            const cells = row.querySelectorAll('td');
+            if (cells.length === 0 || cells.length >= columnCount) return;
+            const lastCell = cells[cells.length - 1];
+            if (!lastCell.hasAttribute('colspan')) return;
+            lastCell.colSpan = columnCount - cells.length + 1;
         });
     }
 
@@ -197,17 +280,17 @@
     function init() {
         addModal();
         defineShowCourseProp();
-        addCourseNameClickEvents();
         removeNoticeButton();
         removeHonorsCourses();
+        enhancePlanCourseTable();
         simplifySccNotice();
 
         // 监听DOM变化（处理动态加载内容）
         const observer = new MutationObserver((mutations) => {
             mutations.forEach((mutation) => {
                 if (mutation.addedNodes.length > 0) {
-                    addCourseNameClickEvents();
                     removeHonorsCourses();
+                    enhancePlanCourseTable();
                     simplifySccNotice();
                 }
             });
@@ -377,17 +460,24 @@
         pageWindow.selectScope = function(aNode) {
             closeFailureMsg();
             
+            const $aNode = $(aNode);
+
             // 根据页面类型获取课程代码
-            let courseCode;
-            if (isCourseNamePage) {
-                // toSCC/toSelectByOrgn/toOEC页面：课程代码在课程名称的下一个td中
-                courseCode = $(aNode).parent().next('td').html();
-            } else {
-                // toSH页面：课程代码在链接文本中
-                courseCode = $(aNode).html();
+            // 培养计划页面的课程名称链接直接把代码挂在 data-course-code 上
+            let courseCode = $aNode.attr('data-course-code');
+            if (!courseCode) {
+                if (isCourseNamePage) {
+                    // toSCC/toSelectByOrgn/toOEC页面：课程代码在课程名称的下一个td中
+                    courseCode = $aNode.parent().next('td').html();
+                } else {
+                    // toSH页面：课程代码在链接文本中
+                    courseCode = $aNode.html();
+                }
+            }
+            if (!isCourseNamePage) {
                 // 高亮选中的行
                 $('#tsCoursesTbl tr.choseTr').removeClass('choseTr');
-                $($(aNode).parents('tr')[0]).addClass('choseTr');
+                $($aNode.parents('tr')[0]).addClass('choseTr');
             }
 
             $.ajax({
