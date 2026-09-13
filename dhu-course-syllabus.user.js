@@ -1,14 +1,19 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      2.12
-// @description  1. 点击课程名称可查看教学大纲 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程
+// @version      2.13
+// @description  1. 点击课程名称可查看教学大纲 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSelectByOrgn*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toOEC*
 // @match        https://jwgl.dhu.edu.cn/dhu/studenthome.jsp*
+// @match        https://webproxy.dhu.edu.cn/https/*/dhu/selectcourse/toSH*
+// @match        https://webproxy.dhu.edu.cn/https/*/dhu/selectcourse/toSCC*
+// @match        https://webproxy.dhu.edu.cn/https/*/dhu/selectcourse/toSelectByOrgn*
+// @match        https://webproxy.dhu.edu.cn/https/*/dhu/selectcourse/toOEC*
+// @match        https://webproxy.dhu.edu.cn/https/*/dhu/studenthome.jsp*
 // @grant        GM_xmlhttpRequest
 // @connect      jw.dhu.edu.cn
 // @run-at       document-idle
@@ -18,6 +23,43 @@
     'use strict';
 
     const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+    // 校外通过 webvpn 访问时，URL 形如 https://webproxy.dhu.edu.cn/https/<token>/dhu/xxx，
+    // 代理会在页面中注入 vpn_rewrite_url，可据此判断当前是否处于代理环境
+    function isWebVpn() {
+        return typeof pageWindow.vpn_rewrite_url === 'function';
+    }
+
+    // 取站点内路径，即去掉 webvpn 的 /https/<token> 前缀，便于与直连环境使用同一套判断
+    function sitePath() {
+        const matched = window.location.pathname.match(/\/dhu\/.*$/);
+        return matched ? matched[0] : window.location.pathname;
+    }
+
+    // 代理环境下需调用页面内的 fetch：vpn 脚本会把站外地址改写为同源代理地址，不受跨域限制；
+    // 脚本沙箱中的 fetch 不会被改写，直连环境则使用 GM_xmlhttpRequest 绕过跨域
+    function fetchExternalText(url, onload, onerror) {
+        if (isWebVpn()) {
+            pageWindow.fetch(url).then(response => response.text()).then(onload).catch(onerror);
+        } else {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                onload: response => onload(response.responseText),
+                onerror: onerror
+            });
+        }
+    }
+
+    // 代理环境下站外链接无法直连，需改写为代理地址后才能访问
+    function toAccessibleUrl(url) {
+        if (!isWebVpn()) return url;
+        try {
+            return pageWindow.vpn_rewrite_url(url);
+        } catch (e) {
+            return url;
+        }
+    }
 
     // 等待页面加载完成
     function waitForElement(selector, callback) {
@@ -179,12 +221,10 @@
     // 从教务处网站获取所有页面的选课手册
     function fetchLatestHandbooks(callback) {
         // 先请求第一页获取总页数
-        GM_xmlhttpRequest({
-            method: 'GET',
-            url: 'https://jw.dhu.edu.cn/9960/list1.htm',
-            onload: function(response) {
-                const totalPages = getTotalPages(response.responseText);
-                const firstPageHandbooks = parseHandbooksFromHTML(response.responseText);
+        fetchExternalText('https://jw.dhu.edu.cn/9960/list1.htm',
+            function(html) {
+                const totalPages = getTotalPages(html);
+                const firstPageHandbooks = parseHandbooksFromHTML(html);
 
                 if (totalPages <= 1) {
                     callback(firstPageHandbooks);
@@ -201,11 +241,9 @@
                 const allHandbooks = [...firstPageHandbooks];
 
                 remainingPages.forEach(pageNum => {
-                    GM_xmlhttpRequest({
-                        method: 'GET',
-                        url: `https://jw.dhu.edu.cn/9960/list${pageNum}.htm`,
-                        onload: function(res) {
-                            const pageHandbooks = parseHandbooksFromHTML(res.responseText);
+                    fetchExternalText(`https://jw.dhu.edu.cn/9960/list${pageNum}.htm`,
+                        function(html) {
+                            const pageHandbooks = parseHandbooksFromHTML(html);
                             allHandbooks.push(...pageHandbooks);
                             completed++;
 
@@ -223,21 +261,21 @@
                                 callback(uniqueHandbooks);
                             }
                         },
-                        onerror: function() {
+                        function() {
                             completed++;
                             if (completed === remainingPages.length) {
                                 allHandbooks.sort((a, b) => parseInt(b.year) - parseInt(a.year));
                                 callback(allHandbooks);
                             }
                         }
-                    });
+                    );
                 });
             },
-            onerror: function() {
+            function() {
                 console.error('获取选课手册失败');
                 callback([]);
             }
-        });
+        );
     }
 
     // 增强选课手册按钮
@@ -277,7 +315,7 @@
                         link.style.color = 'red';
                         link.style.fontWeight = 'bold';
                         link.textContent = handbook.name;
-                        link.href = handbook.url;
+                        link.href = toAccessibleUrl(handbook.url);
                         link.target = '_blank';
 
                         btnGroup.appendChild(span);
@@ -299,7 +337,7 @@
         // 这些页面的课程代码位于课程名称所在单元格的下一列
         const COURSE_CODE_NEXT_CELL_PAGES = ['/toSCC', '/toSelectByOrgn', '/toOEC'];
         const isCourseNamePage = COURSE_CODE_NEXT_CELL_PAGES.some(page =>
-            window.location.pathname.endsWith(page)
+            sitePath().endsWith(page)
         );
 
         pageWindow.selectScope = function(aNode) {
@@ -509,7 +547,7 @@
     removeEvalGuide();
 
     // 以下增强仅用于选课页面，首页没有相应函数，既无需执行也无需轮询
-    if (window.location.pathname.startsWith('/dhu/selectcourse/')) {
+    if (sitePath().startsWith('/dhu/selectcourse/')) {
         // 等待表格加载完成后初始化
         waitForElement('table tbody', init);
 
