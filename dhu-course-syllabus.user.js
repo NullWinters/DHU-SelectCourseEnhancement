@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      2.15
+// @version      2.16
 // @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问 7. 简化文化素质类课程数量提示
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
@@ -116,6 +116,9 @@
         { title: '教学日历', type: 2 }
     ];
 
+    // 班次列表弹窗中的班次表格，各选课页面共用同一个 id
+    const CLASS_LIST_TABLE_ID = 'accessClassTbl';
+
     // 表头由服务端渲染一次，追加两列的同时收窄课程名称与学期列，保持总宽度仍为 100%
     function enhancePlanTableHeader(table) {
         const headerRow = table.querySelector('thead tr');
@@ -179,6 +182,16 @@
         const style = document.createElement('style');
         style.id = 'planTableStyle';
         style.textContent = `#${PLAN_TABLE_ID} th, #${PLAN_TABLE_ID} td { text-align: center; }`;
+        document.head.appendChild(style);
+    }
+
+    // 班次列表弹窗的表格由 DataTables 生成，表头居中而数据行左对齐，这里统一居中
+    function addClassListTableStyle() {
+        if (document.getElementById('classListTableStyle')) return;
+
+        const style = document.createElement('style');
+        style.id = 'classListTableStyle';
+        style.textContent = `#${CLASS_LIST_TABLE_ID} th, #${CLASS_LIST_TABLE_ID} td { text-align: center; }`;
         document.head.appendChild(style);
     }
 
@@ -280,6 +293,7 @@
     function init() {
         addModal();
         defineShowCourseProp();
+        addClassListTableStyle();
         removeNoticeButton();
         removeHonorsCourses();
         enhancePlanCourseTable();
