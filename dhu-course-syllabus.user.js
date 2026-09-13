@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      2.11
-// @description  1. 点击课程名称可查看教学大纲 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南
+// @version      2.12
+// @description  1. 点击课程名称可查看教学大纲 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
@@ -83,7 +83,8 @@
                     const courseCode = courseCodeCell.textContent.trim();
 
                     // 跳过分类标题行（如"必修课"、"选修课"等）
-                    if (courseName && !courseName.includes('要求学分') && !courseName.includes('获得学分') && courseCode.match(/^\d+$/)) {
+                    // 同时跳过纯数字单元格（学分类）：部分页面第 3 列并非课程名称
+                    if (courseName && !/^[\d.]+$/.test(courseName) && !courseName.includes('要求学分') && !courseName.includes('获得学分') && courseCode.match(/^\d+$/)) {
                         courseNameCell.dataset.courseBind = 'true';
                         courseNameCell.style.cursor = 'pointer';
                         courseNameCell.style.color = '#0066cc';
@@ -106,10 +107,13 @@
     }
 
     // 删除荣誉课程表格
+    // 该汇总表块由选课页面的 selecthome.js 追加到 #tsCoursesTbl 中，其首个单元格固定为“荣誉课程”；
+    // 限定在该表格内精确匹配，避免误删其他页面中名称含“荣誉课程”字样的普通课程
     function removeHonorsCourses() {
-        const rows = document.querySelectorAll('tr');
+        const rows = document.querySelectorAll('#tsCoursesTbl tr');
         rows.forEach(row => {
-            if (row.textContent.includes('荣誉课程')) {
+            const firstCell = row.querySelector('td');
+            if (firstCell && firstCell.textContent.trim() === '荣誉课程') {
                 row.remove();
             }
         });
@@ -364,6 +368,129 @@
         pageWindow.selectScopeEnhanced = true;
     }
 
+    // 增强 initOrgnCourse：后端的 initSCByOrgn 只接受单个学院 ID，
+    // “全校”选项（id=61）不会返回任何课程，因此在前端遍历下拉框中所有学院并合并渲染
+    const ALL_SCHOOL_ORGN_ID = '61';
+    const ORGN_QUERY_CONCURRENCY = 6;
+
+    // 查询单个学院的课程；请求失败时弹窗提示并返回 null
+    function queryOrgnCourses(orgnId) {
+        return new Promise((resolve) => {
+            $.ajax({
+                url: contextPath + '/selectcourse/initSCByOrgn',
+                type: 'POST',
+                dataType: 'json',
+                data: { orgnId: orgnId },
+                success: function(result) {
+                    resolve(result);
+                },
+                error: function() {
+                    alert('');
+                    resolve(null);
+                }
+            });
+        });
+    }
+
+    // 与页面原有的 initOrgnCourse 保持一致的 7 列渲染
+    function buildOrgnCourseRows(orgnCourses) {
+        const gradeFlag = String(pageWindow.grade || '').match(/\d+/g) || 0;
+        const stripArtSort = Number(gradeFlag[0]) > 2024;
+        let courseHtml = '';
+
+        for (let i = 0; i < orgnCourses.length; i++) {
+            const course = orgnCourses[i];
+            let smallSortDesc = course.smallSortDesc == null ? '' : String(course.smallSortDesc);
+            if (stripArtSort) {
+                smallSortDesc = smallSortDesc.replace('艺术类、', '').replace('艺术类', '');
+            }
+
+            courseHtml += '<tr>' +
+                '<td><a onclick="selectScope(this)">' + course.courseName + '</a></td>' +
+                '<td>' + course.courseCode + '</td>' +
+                '<td>' + course.credit + '</td>' +
+                '<td><a onclick="showCourseProp(\'' + course.courseCode + '\',2)">课程日历</a></td>' +
+                '<td><a onclick="showCourseProp(\'' + course.courseCode + '\',1)">教学大纲</a></td>' +
+                '<td>' + course.bigSort + '</td>' +
+                '<td>' + course.smallSort + '<span style="color:red;margin-left:5px;">' + smallSortDesc + '</span></td>' +
+                '</tr>';
+        }
+
+        return courseHtml;
+    }
+
+    // 课程列表为空时给出提示，避免表格被静默清空
+    function setCourseTblMessage(html) {
+        $('#courseTbl tbody').html('<tr><td colspan="7" style="text-align:center;color:#999;">' + html + '</td></tr>');
+    }
+
+    // 并发查询所有学院，渲染时保持下拉栏中的学院顺序
+    async function loadAllOrgnCourses(orgnIds) {
+        const buckets = new Array(orgnIds.length);
+        let cursor = 0;
+        let finished = 0;
+
+        setCourseTblMessage('正在加载全部学院课程 <span id="orgnProgress">0/' + orgnIds.length + '</span>');
+
+        const worker = async () => {
+            while (cursor < orgnIds.length) {
+                const index = cursor++;
+                const result = await queryOrgnCourses(orgnIds[index]);
+                if (result) {
+                    buckets[index] = result.success ? (result.orgnCourses || []) : [];
+                }
+                finished++;
+                const progress = document.getElementById('orgnProgress');
+                if (progress) {
+                    progress.textContent = finished + '/' + orgnIds.length;
+                }
+            }
+        };
+
+        await Promise.all(Array.from({ length: ORGN_QUERY_CONCURRENCY }, worker));
+
+        const allCourses = [].concat(...buckets.filter(bucket => bucket));
+        if (allCourses.length === 0) {
+            setCourseTblMessage('未查询到任何学院的课程');
+            return;
+        }
+        $('#courseTbl tbody').html(buildOrgnCourseRows(allCourses));
+    }
+
+    function enhanceInitOrgnCourse() {
+        if (!pageWindow.initOrgnCourse || pageWindow.initOrgnCourseEnhanced) return;
+
+        pageWindow.initOrgnCourse = async function() {
+            const orgnId = $('#asOrgn').val();
+
+            if (orgnId === ALL_SCHOOL_ORGN_ID) {
+                // 收集下拉栏中的所有学院（排除空白选项与“全校”自身）
+                const orgnIds = $('#asOrgn option').map(function() {
+                    return this.value;
+                }).get().filter(value => value !== '' && value !== ALL_SCHOOL_ORGN_ID);
+                await loadAllOrgnCourses(orgnIds);
+                return;
+            }
+
+            const result = await queryOrgnCourses(orgnId);
+            if (!result) return;
+
+            if (!result.success) {
+                alert(result.msg);
+                return;
+            }
+
+            const courses = result.orgnCourses || [];
+            if (courses.length === 0) {
+                setCourseTblMessage('未查询到课程');
+                return;
+            }
+            $('#courseTbl tbody').html(buildOrgnCourseRows(courses));
+        };
+
+        pageWindow.initOrgnCourseEnhanced = true;
+    }
+
     // 移除首页浮动的“评教指南”图片
     // 该图片由 div-float.js 驱动，会在页面上不停弹跳，点击后跳转到 evalHelp.jsp
     function removeEvalGuide() {
@@ -393,6 +520,9 @@
             }
             if (pageWindow.selectScope && !pageWindow.selectScopeEnhanced) {
                 enhanceSelectScope();
+            }
+            if (pageWindow.initOrgnCourse && !pageWindow.initOrgnCourseEnhanced) {
+                enhanceInitOrgnCourse();
             }
             if (!pageWindow.showScmTblEnhanced || !pageWindow.selectScopeEnhanced) {
                 setTimeout(tryEnhance, 200);
