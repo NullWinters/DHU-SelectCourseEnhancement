@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      2.9
-// @description  1. 点击课程名称可查看教学大纲 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表
+// @version      2.11
+// @description  1. 点击课程名称可查看教学大纲 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSelectByOrgn*
+// @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toOEC*
+// @match        https://jwgl.dhu.edu.cn/dhu/studenthome.jsp*
 // @grant        GM_xmlhttpRequest
 // @connect      jw.dhu.edu.cn
 // @run-at       document-idle
@@ -290,8 +292,11 @@
         if (!pageWindow.selectScope || pageWindow.selectScopeEnhanced) return;
 
         const originalSelectScope = pageWindow.selectScope;
-        const isCourseNamePage = window.location.href.includes('/toSCC') || 
-                                 window.location.href.includes('/toSelectByOrgn');
+        // 这些页面的课程代码位于课程名称所在单元格的下一列
+        const COURSE_CODE_NEXT_CELL_PAGES = ['/toSCC', '/toSelectByOrgn', '/toOEC'];
+        const isCourseNamePage = COURSE_CODE_NEXT_CELL_PAGES.some(page =>
+            window.location.pathname.endsWith(page)
+        );
 
         pageWindow.selectScope = function(aNode) {
             closeFailureMsg();
@@ -299,7 +304,7 @@
             // 根据页面类型获取课程代码
             let courseCode;
             if (isCourseNamePage) {
-                // toSCC/toSelectByOrgn页面：课程代码在课程名称的下一个td中
+                // toSCC/toSelectByOrgn/toOEC页面：课程代码在课程名称的下一个td中
                 courseCode = $(aNode).parent().next('td').html();
             } else {
                 // toSH页面：课程代码在链接文本中
@@ -359,22 +364,42 @@
         pageWindow.selectScopeEnhanced = true;
     }
 
-    // 等待表格加载完成后初始化
-    waitForElement('table tbody', init);
+    // 移除首页浮动的“评教指南”图片
+    // 该图片由 div-float.js 驱动，会在页面上不停弹跳，点击后跳转到 evalHelp.jsp
+    function removeEvalGuide() {
+        const tips = document.getElementById('tips');
+        if (!tips || !tips.querySelector('a[href*="evalHelp"]')) return;
 
-    // 增强选课手册按钮 - 使用轮询检测函数是否可用
-    function tryEnhance() {
-        if (pageWindow.showScmTbl && !pageWindow.showScmTblEnhanced) {
-            enhanceHandbookButton();
-        }
-        if (pageWindow.selectScope && !pageWindow.selectScopeEnhanced) {
-            enhanceSelectScope();
-        }
-        if (!pageWindow.showScmTblEnhanced || !pageWindow.selectScopeEnhanced) {
-            setTimeout(tryEnhance, 200);
+        tips.remove();
+
+        // 同时停掉 div-float.js 的定时器，否则它会一直对已移除的元素做位移计算
+        if (pageWindow.interval) {
+            pageWindow.clearInterval(pageWindow.interval);
+            pageWindow.interval = null;
         }
     }
 
-    // 开始尝试增强
-    tryEnhance();
+    removeEvalGuide();
+
+    // 以下增强仅用于选课页面，首页没有相应函数，既无需执行也无需轮询
+    if (window.location.pathname.startsWith('/dhu/selectcourse/')) {
+        // 等待表格加载完成后初始化
+        waitForElement('table tbody', init);
+
+        // 增强选课手册按钮 - 使用轮询检测函数是否可用
+        const tryEnhance = () => {
+            if (pageWindow.showScmTbl && !pageWindow.showScmTblEnhanced) {
+                enhanceHandbookButton();
+            }
+            if (pageWindow.selectScope && !pageWindow.selectScopeEnhanced) {
+                enhanceSelectScope();
+            }
+            if (!pageWindow.showScmTblEnhanced || !pageWindow.selectScopeEnhanced) {
+                setTimeout(tryEnhance, 200);
+            }
+        };
+
+        // 开始尝试增强
+        tryEnhance();
+    }
 })();
