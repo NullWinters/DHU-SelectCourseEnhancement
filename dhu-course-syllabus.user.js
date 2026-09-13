@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      3.2
-// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课
+// @version      3.3
+// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webvpn 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课 11. 培养计划页面底部追加超星学习通自选课程入口
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
@@ -488,6 +488,37 @@
         table.parentNode.insertBefore(bar, table.nextSibling);
     }
 
+    // 培养计划页面底部的超星学习通自选课程入口
+    // 学习通是站外系统，与教务系统之间只有链接跳转、没有数据交换，因此只追加一个链接
+    const CHAOXING_ENTRY_ID = 'chaoxingEntry';
+    const CHAOXING_PORTAL_URL = 'https://dhu1.fanya.chaoxing.com/portal';
+
+    function addChaoxingEntry() {
+        if (!sitePath().startsWith('/dhu/selectcourse/toSH')) return;
+        if (document.getElementById(CHAOXING_ENTRY_ID)) return;
+
+        const table = document.getElementById(PLAN_TABLE_ID);
+        if (!table || !table.parentNode) return;
+
+        const entry = document.createElement('div');
+        entry.id = CHAOXING_ENTRY_ID;
+        entry.style.textAlign = 'center';
+        entry.style.marginTop = '10px';
+
+        const link = document.createElement('a');
+        link.textContent = '超星学习通自选课程';
+        link.title = CHAOXING_PORTAL_URL;
+        link.style.fontSize = '14px';
+        link.style.color = '#0066cc';
+        link.href = toAccessibleUrl(CHAOXING_PORTAL_URL);
+        link.target = '_blank';
+
+        entry.appendChild(link);
+        // 追加到表格所在容器的末尾，即页面正文的最底部；
+        // 其它课程的行都插在表格内部，“其它课程”按钮也在表格之后插入，均位于此处之上
+        table.parentNode.appendChild(entry);
+    }
+
     // 删除"选课注意事项"按钮
     function removeNoticeButton() {
         const links = document.querySelectorAll('a[onclick*="showNotice"]');
@@ -550,6 +581,7 @@
         removeHonorsCourses();
         enhancePlanCourseTable();
         addOtherCoursesToggle();
+        addChaoxingEntry();
         simplifySccNotice();
 
         // 监听DOM变化（处理动态加载内容）
@@ -559,6 +591,7 @@
                     removeHonorsCourses();
                     enhancePlanCourseTable();
                     addOtherCoursesToggle();
+                    addChaoxingEntry();
                     simplifySccNotice();
                 }
             });
