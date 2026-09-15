@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      3.4
-// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有学院的课程 6. 兼容校外 webproxy 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课 11. 培养计划页面底部追加超星学习通自选课程入口
+// @version      3.5
+// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有开课部门的课程 6. 兼容校外 webproxy 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课 11. 培养计划页面底部追加超星学习通自选课程入口
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
@@ -1195,13 +1195,13 @@
         pageWindow.selectSubmitEnhanced = true;
     }
 
-    // 增强 initOrgnCourse：后端的 initSCByOrgn 只接受单个学院 ID，
-    // “全校”选项（id=61）不会返回任何课程，因此在前端遍历下拉框中所有学院并合并渲染
+    // 增强 initOrgnCourse：后端的 initSCByOrgn 只接受单个部门 ID，
+    // “全校”选项（id=61）不会返回任何课程，因此在前端遍历所有开课部门并合并渲染
     const ALL_SCHOOL_ORGN_ID = '61';
     const ORGN_QUERY_CONCURRENCY = 6;
 
-    // 查询单个学院的课程；请求失败时弹窗提示并返回 null
-    function queryOrgnCourses(orgnId) {
+    // 查询单个部门的课程；请求失败时返回 null，silent 为真时不弹窗
+    function queryOrgnCourses(orgnId, silent) {
         return new Promise((resolve) => {
             $.ajax({
                 url: contextPath + '/selectcourse/initSCByOrgn',
@@ -1212,7 +1212,33 @@
                     resolve(result);
                 },
                 error: function() {
-                    alert('');
+                    if (!silent) alert('');
+                    resolve(null);
+                }
+            });
+        });
+    }
+
+    // 取全部开课部门 ID。
+    // 页面下拉栏由 getAllOrgnizations({isAcademy:true}) 填充，只会列出 44 个院系，
+    // 而 orgnSS 在 isAcademy 非 1 时会返回全部部门（含团委等只出现在隐藏项里的开课单位）。
+    // 只按下拉栏聚合会漏掉这些部门的课程，所以这里直接查询完整列表。
+    function fetchAllOrgnIds() {
+        return new Promise((resolve) => {
+            $.ajax({
+                url: contextPath + '/common/orgnSS',
+                type: 'POST',
+                dataType: 'json',
+                data: { ordered: false, sortType: 'asc', isAcademy: 0 },
+                success: function(result) {
+                    if (!result.success || !result.orgnSS) {
+                        resolve(null);
+                        return;
+                    }
+                    resolve(result.orgnSS.map(orgn => String(orgn.id))
+                        .filter(id => id !== '' && id !== ALL_SCHOOL_ORGN_ID));
+                },
+                error: function() {
                     resolve(null);
                 }
             });
@@ -1251,20 +1277,23 @@
         $('#courseTbl tbody').html('<tr><td colspan="7" style="text-align:center;color:#999;">' + html + '</td></tr>');
     }
 
-    // 并发查询所有学院，渲染时保持下拉栏中的学院顺序
+    // 并发查询所有部门，渲染时保持 orgnSS 返回的部门顺序；无课程的部门自然被跳过
     async function loadAllOrgnCourses(orgnIds) {
         const buckets = new Array(orgnIds.length);
         let cursor = 0;
         let finished = 0;
+        let failed = 0;
 
-        setCourseTblMessage('正在加载全部学院课程 <span id="orgnProgress">0/' + orgnIds.length + '</span>');
+        setCourseTblMessage('正在加载全部开课单位课程 <span id="orgnProgress">0/' + orgnIds.length + '</span>');
 
         const worker = async () => {
             while (cursor < orgnIds.length) {
                 const index = cursor++;
-                const result = await queryOrgnCourses(orgnIds[index]);
+                const result = await queryOrgnCourses(orgnIds[index], true);
                 if (result) {
                     buckets[index] = result.success ? (result.orgnCourses || []) : [];
+                } else {
+                    failed++;
                 }
                 finished++;
                 const progress = document.getElementById('orgnProgress');
@@ -1278,7 +1307,7 @@
 
         const allCourses = [].concat(...buckets.filter(bucket => bucket));
         if (allCourses.length === 0) {
-            setCourseTblMessage('未查询到任何学院的课程');
+            setCourseTblMessage(failed > 0 ? '查询开课单位课程失败，请重试' : '未查询到任何开课单位的课程');
             return;
         }
         $('#courseTbl tbody').html(buildOrgnCourseRows(allCourses));
@@ -1291,10 +1320,11 @@
             const orgnId = $('#asOrgn').val();
 
             if (orgnId === ALL_SCHOOL_ORGN_ID) {
-                // 收集下拉栏中的所有学院（排除空白选项与“全校”自身）
-                const orgnIds = $('#asOrgn option').map(function() {
-                    return this.value;
-                }).get().filter(value => value !== '' && value !== ALL_SCHOOL_ORGN_ID);
+                const orgnIds = await fetchAllOrgnIds();
+                if (!orgnIds) {
+                    alert('获取开课单位列表失败，请重试');
+                    return;
+                }
                 await loadAllOrgnCourses(orgnIds);
                 return;
             }
