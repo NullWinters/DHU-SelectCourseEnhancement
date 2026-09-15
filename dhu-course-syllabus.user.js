@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      3.7
-// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有开课部门的课程 6. 兼容校外 webproxy 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课 11. 培养计划页面底部追加超星学习通自选课程入口 12. 教学大纲/教学日历无内容时给出占位提示 13. 教学大纲/教学日历弹窗内可下载为 Word 文档
+// @version      3.8
+// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有开课部门的课程 6. 兼容校外 webproxy 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课 11. 培养计划页面底部追加超星学习通自选课程入口 12. 教学大纲/教学日历无内容时给出占位提示 13. 教学大纲/教学日历弹窗内可下载为 Word 文档 14. 选课页面左上角追加可展开的课程表侧边栏，课表下方列出未设置上课时间的课程
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
@@ -790,6 +790,356 @@
                 row.remove();
             }
         });
+    }
+
+    // ---- 左侧课程表侧边栏 ----
+    // 选课时经常要确认某个时间段是否已经排课，这里把课程表页面（StudentCourseTable）的能力
+    // 搬成侧边栏：学期列表取自 /common/semesterSS，课表由 /StudentCourseTable/getData 渲染，
+    // 与课程表页面自身用的是同一组接口。getData 使用会话中的学生，因此不必传学号
+    const COURSE_TABLE_SIDEBAR_ID = 'courseTableSidebar';
+    const COURSE_TABLE_HANDLE_ID = 'courseTableSidebarHandle';
+    const COURSE_TABLE_TERM_ID = 'courseTableSidebarTerm';
+    const COURSE_TABLE_STYLE_ID = 'courseTableSidebarStyle';
+    const COURSE_TABLE_WIDTH_KEY = 'dhuCourseTableWidth';
+    const COURSE_TABLE_TERM_KEY = 'dhuCourseTableTerm';
+    const COURSE_TABLE_WIDTH_DEFAULT = 560;
+    // 与课程表页面下方那张表的列一致
+    const COURSE_TABLE_NOTIME_COLUMNS = ['选课序号', '课程代码', '课程名称', '组班序号', '授课教师'];
+
+    // 学期列表只在首次展开时拉取，收起状态下不产生额外请求
+    let courseTableTerms = null;
+
+    function addCourseTableSidebarStyle() {
+        if (document.getElementById(COURSE_TABLE_STYLE_ID)) return;
+
+        const style = document.createElement('style');
+        style.id = COURSE_TABLE_STYLE_ID;
+        style.textContent = `
+            /* 页头（.header_sui，固定定位且高 50px）会盖住左上角，把手从页头下沿开始贴左显示 */
+            #${COURSE_TABLE_HANDLE_ID} {
+                position: fixed; left: 0; top: 50px;
+                z-index: 1030; padding: 6px 12px; cursor: pointer;
+                font-size: 13px; line-height: 1; letter-spacing: 1px; user-select: none;
+                color: #fff; background: #4b8df8;
+                border-radius: 0 0 4px 0; box-shadow: 0 1px 6px rgba(0, 0, 0, .25);
+            }
+            #${COURSE_TABLE_HANDLE_ID}:hover { background: #3b7ee0; }
+
+            /* 面板位于页头（z-index 9995）之下、bootstrap 弹窗（1050）之上，
+               这样弹窗仍能盖住侧边栏，查看大纲/班次列表时不会被遮挡 */
+            #${COURSE_TABLE_SIDEBAR_ID} {
+                position: fixed; left: 0; top: 50px; width: 560px; z-index: 1030;
+                /* 高度跟随内容，课表下方不留大片空白；超出可视区域时只在 .cts-body 内滚动 */
+                max-height: calc(100vh - 50px);
+                display: flex; flex-direction: column;
+                background: #fff; border-right: 1px solid #d4d4d4;
+                box-shadow: 2px 0 12px rgba(0, 0, 0, .18);
+                font-size: 12px; color: #333;
+                transform: translateX(-100%); transition: transform .18s ease-out;
+            }
+            #${COURSE_TABLE_SIDEBAR_ID}.cts-open { transform: translateX(0); }
+
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-head {
+                flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+                padding: 8px 10px; background: #f7f7f7; border-bottom: 1px solid #e5e5e5;
+            }
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-title { font-size: 13px; font-weight: bold; white-space: nowrap; }
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-term { flex: 1 1 auto; min-width: 0; height: 26px; font-size: 12px; }
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-close {
+                flex: 0 0 auto; padding: 0 4px; font-size: 18px; line-height: 1;
+                color: #888; background: transparent; border: 0; cursor: pointer;
+            }
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-close:hover { color: #333; }
+
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 8px; }
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-hint { padding: 12px 4px; color: #999; text-align: center; }
+
+            /* 服务端课表是按整页宽度排的，压进侧边栏后列宽交给浏览器均分，长课名换行显示 */
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-timetable table {
+                width: 100%; margin: 0; border-collapse: collapse; table-layout: fixed; font-size: 11px;
+            }
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-timetable td {
+                padding: 3px 2px; text-align: center; vertical-align: middle;
+                word-break: break-all; line-height: 1.35; border: 1px solid #999;
+            }
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-timetable td:first-child { width: 38px; background: #f5f5f5; }
+
+            /* 未设置上课时间的课程（期末实践类、暑期课程等）跟在课表下方 */
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-notime { margin-top: 12px; }
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-notime-tip { margin-bottom: 6px; color: #666; line-height: 1.5; }
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-notime-table { width: 100%; margin: 0; border-collapse: collapse; font-size: 11px; }
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-notime-table th,
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-notime-table td {
+                padding: 3px 2px; text-align: center; vertical-align: middle;
+                word-break: break-all; line-height: 1.35; border: 1px solid #999;
+            }
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-notime-table th { background: #f5f5f5; }
+
+            #${COURSE_TABLE_SIDEBAR_ID} .cts-resizer {
+                position: absolute; top: 0; right: -3px; bottom: 0; width: 6px; cursor: col-resize;
+            }`;
+        document.head.appendChild(style);
+    }
+
+    function courseTableStore(key, value) {
+        try {
+            if (value === undefined) return window.localStorage.getItem(key);
+            window.localStorage.setItem(key, value);
+        } catch (e) {
+            // 隐私模式等场景下 localStorage 不可用，退化为不记忆即可
+        }
+        return null;
+    }
+
+    function courseTableContextPath() {
+        return pageWindow.contextPath || '/dhu';
+    }
+
+    // 20262027a → 2026-2027 学年 第 1 学期，与课程表页面标题的写法保持一致
+    function formatCourseTableTerm(name) {
+        const matched = /^(\d{4})(\d{4})([as])$/.exec(String(name || ''));
+        if (!matched) return String(name || '');
+        return matched[1] + '-' + matched[2] + ' 学年 第 ' + (matched[3] === 'a' ? 1 : 2) + ' 学期';
+    }
+
+    function courseTableContent() {
+        return document.querySelector('#' + COURSE_TABLE_SIDEBAR_ID + ' .cts-content');
+    }
+
+    function showCourseTableMessage(text) {
+        const content = courseTableContent();
+        if (!content) return;
+
+        content.innerHTML = '';
+        const hint = document.createElement('div');
+        hint.className = 'cts-hint';
+        hint.textContent = text;
+        content.appendChild(hint);
+    }
+
+    // 表头行与“节”列以外的单元格才是课程，据此判断该学期是否排了课
+    function courseTableHasCourses(html) {
+        const holder = document.createElement('div');
+        holder.innerHTML = html;
+        const table = holder.querySelector('table');
+        if (!table) return false;
+
+        return Array.prototype.some.call(table.rows, (row, index) =>
+            index > 0 && Array.prototype.some.call(row.cells,
+                cell => cell.cellIndex >= 1 && cell.textContent.trim() !== ''));
+    }
+
+    function renderCourseTable(term, result) {
+        const content = courseTableContent();
+        const body = document.querySelector('#' + COURSE_TABLE_SIDEBAR_ID + ' .cts-body');
+        if (!content) return;
+
+        content.innerHTML = '';
+        if (!courseTableHasCourses(result.content)) {
+            const hint = document.createElement('div');
+            hint.className = 'cts-hint';
+            hint.textContent = formatCourseTableTerm(term.name) + ' 暂无课程安排';
+            content.appendChild(hint);
+        }
+        content.insertAdjacentHTML('beforeend', '<div class="cts-timetable">' + result.content + '</div>');
+
+        const noTimeCourses = renderNoTimeCourses(term, result.list);
+        if (noTimeCourses) content.appendChild(noTimeCourses);
+
+        if (body) body.scrollTop = 0;
+    }
+
+    // getData 的 list 只包含没有排进课表格子的课程，即课程表页面下方的
+    // “本学期没有设置上课时间的课程”（期末实践类、暑期课程等），这里照搬同一份数据
+    function renderNoTimeCourses(term, list) {
+        if (!list || !list.length) return null;
+
+        const section = document.createElement('div');
+        section.className = 'cts-notime';
+
+        const tip = document.createElement('div');
+        tip.className = 'cts-notime-tip';
+        tip.textContent = '以下是' + formatCourseTableTerm(term.name) + '没有设置上课时间的课程'
+            + '（包括期末实践类、暑期课程等。实践类课程由学院安排，暑期课程上课时间在教务处主页通知公布。）';
+        section.appendChild(tip);
+
+        const table = document.createElement('table');
+        table.className = 'cts-notime-table';
+        const head = document.createElement('thead');
+        head.innerHTML = '<tr>' + COURSE_TABLE_NOTIME_COLUMNS.map(name => '<th>' + name + '</th>').join('') + '</tr>';
+        table.appendChild(head);
+
+        const tbody = document.createElement('tbody');
+        list.forEach(item => {
+            const row = document.createElement('tr');
+            [item.ID, item.KCBH, item.KCMC, item.SZBH, item.XM].forEach(value => {
+                const cell = document.createElement('td');
+                cell.textContent = value == null ? '' : value;
+                row.appendChild(cell);
+            });
+            tbody.appendChild(row);
+        });
+        table.appendChild(tbody);
+
+        section.appendChild(table);
+        return section;
+    }
+
+    function loadCourseTable(term) {
+        showCourseTableMessage('正在加载课程表…');
+        $.ajax({
+            url: courseTableContextPath() + '/StudentCourseTable/getData',
+            type: 'POST',
+            dataType: 'json',
+            data: { yearTermId: term.id, yearTermName: term.name },
+            success: function(result) {
+                if (!result || !result.success || !result.content) {
+                    showCourseTableMessage('课程表加载失败' + (result && result.msg ? '：' + result.msg : ''));
+                    return;
+                }
+                renderCourseTable(term, result);
+            },
+            error: function() {
+                showCourseTableMessage('课程表加载失败，请稍后重试。');
+            }
+        });
+    }
+
+    // 优先用上次看过的学期，其次当前学期（接口里 current 为 1），最后退回列表首个即最新学期
+    function pickCourseTableTerm() {
+        if (!courseTableTerms || !courseTableTerms.length) return null;
+
+        const saved = courseTableStore(COURSE_TABLE_TERM_KEY);
+        return courseTableTerms.find(term => term.name === saved)
+            || courseTableTerms.find(term => term.current == 1)
+            || courseTableTerms[0];
+    }
+
+    function fillCourseTableTermSelect() {
+        const select = document.getElementById(COURSE_TABLE_TERM_ID);
+        if (!select) return;
+
+        select.innerHTML = '';
+        courseTableTerms.forEach(term => {
+            const option = document.createElement('option');
+            option.value = term.id;
+            option.textContent = formatCourseTableTerm(term.name);
+            select.appendChild(option);
+        });
+
+        const picked = pickCourseTableTerm();
+        if (picked) select.value = picked.id;
+    }
+
+    function ensureCourseTableTerms() {
+        showCourseTableMessage('正在加载学期列表…');
+        $.ajax({
+            url: courseTableContextPath() + '/common/semesterSS',
+            type: 'POST',
+            dataType: 'json',
+            data: { ordered: true, sortType: 'desc' },
+            success: function(result) {
+                if (!result || !result.success || !result.semesterSS || !result.semesterSS.length) {
+                    showCourseTableMessage('学期列表加载失败' + (result && result.msg ? '：' + result.msg : ''));
+                    return;
+                }
+
+                courseTableTerms = result.semesterSS;
+                fillCourseTableTermSelect();
+                const picked = pickCourseTableTerm();
+                if (picked) {
+                    loadCourseTable(picked);
+                } else {
+                    showCourseTableMessage('未找到可用的学期。');
+                }
+            },
+            error: function() {
+                showCourseTableMessage('学期列表加载失败，请稍后重试。');
+            }
+        });
+    }
+
+    function openCourseTableSidebar() {
+        const panel = document.getElementById(COURSE_TABLE_SIDEBAR_ID);
+        const handle = document.getElementById(COURSE_TABLE_HANDLE_ID);
+        if (!panel) return;
+
+        panel.classList.add('cts-open');
+        if (handle) handle.style.display = 'none';
+        if (!courseTableTerms) ensureCourseTableTerms();
+    }
+
+    function closeCourseTableSidebar() {
+        const panel = document.getElementById(COURSE_TABLE_SIDEBAR_ID);
+        const handle = document.getElementById(COURSE_TABLE_HANDLE_ID);
+        if (panel) panel.classList.remove('cts-open');
+        if (handle) handle.style.display = '';
+    }
+
+    function courseTableWidth(width) {
+        const max = Math.max(320, Math.min(1000, document.documentElement.clientWidth - 120));
+        return Math.min(Math.max(width, 320), max);
+    }
+
+    function installCourseTableResizer(panel, resizer) {
+        let dragging = false;
+
+        resizer.addEventListener('mousedown', event => {
+            dragging = true;
+            event.preventDefault();
+            document.body.style.userSelect = 'none';
+        });
+
+        document.addEventListener('mousemove', event => {
+            if (!dragging) return;
+            panel.style.width = courseTableWidth(event.clientX - panel.getBoundingClientRect().left) + 'px';
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (!dragging) return;
+            dragging = false;
+            document.body.style.userSelect = '';
+            courseTableStore(COURSE_TABLE_WIDTH_KEY, parseInt(panel.style.width, 10));
+        });
+    }
+
+    function addCourseTableSidebar() {
+        if (document.getElementById(COURSE_TABLE_SIDEBAR_ID)) return;
+
+        addCourseTableSidebarStyle();
+
+        const handle = document.createElement('div');
+        handle.id = COURSE_TABLE_HANDLE_ID;
+        handle.title = '查看课程表';
+        handle.textContent = '课程表';
+
+        const panel = document.createElement('div');
+        panel.id = COURSE_TABLE_SIDEBAR_ID;
+        panel.innerHTML = `
+            <div class="cts-head">
+                <span class="cts-title">课程表</span>
+                <select id="${COURSE_TABLE_TERM_ID}" class="cts-term"></select>
+                <button type="button" class="cts-close" title="收起">&laquo;</button>
+            </div>
+            <div class="cts-body"><div class="cts-content"></div></div>
+            <div class="cts-resizer" title="拖动调整宽度"></div>`;
+
+        document.body.appendChild(handle);
+        document.body.appendChild(panel);
+
+        const savedWidth = parseInt(courseTableStore(COURSE_TABLE_WIDTH_KEY), 10);
+        panel.style.width = courseTableWidth(savedWidth || COURSE_TABLE_WIDTH_DEFAULT) + 'px';
+
+        handle.addEventListener('click', openCourseTableSidebar);
+        panel.querySelector('.cts-close').addEventListener('click', closeCourseTableSidebar);
+        document.getElementById(COURSE_TABLE_TERM_ID).addEventListener('change', event => {
+            const term = (courseTableTerms || []).find(item => String(item.id) === event.target.value);
+            if (!term) return;
+
+            courseTableStore(COURSE_TABLE_TERM_KEY, term.name);
+            loadCourseTable(term);
+        });
+        installCourseTableResizer(panel, panel.querySelector('.cts-resizer'));
     }
 
     // 初始化
@@ -1591,6 +1941,9 @@
 
     // 以下增强仅用于选课页面，首页没有相应函数，既无需执行也无需轮询
     if (sitePath().startsWith('/dhu/selectcourse/')) {
+        // 侧边栏不依赖页面表格，直接挂载，避免个别页面没有表格时被一起跳过
+        addCourseTableSidebar();
+
         // 等待表格加载完成后初始化
         waitForElement('table tbody', init);
 
