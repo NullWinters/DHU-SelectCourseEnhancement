@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      3.5
-// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有开课部门的课程 6. 兼容校外 webproxy 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课 11. 培养计划页面底部追加超星学习通自选课程入口
+// @version      3.7
+// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有开课部门的课程 6. 兼容校外 webproxy 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课 11. 培养计划页面底部追加超星学习通自选课程入口 12. 教学大纲/教学日历无内容时给出占位提示 13. 教学大纲/教学日历弹窗内可下载为 Word 文档
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
@@ -85,6 +85,7 @@
                 <div class="modal-body content" style="font-size:14px;height: 400px;margin-bottom:0;"></div>
             </div>
             <div class="modal-footer">
+                <button type="button" id="materialDownloadBtn" class="btn green" style="display: none;">下载为 Word 文档</button>
                 <button type="button" data-dismiss="modal" class="btn">取消</button>
             </div>
         </div>`;
@@ -104,6 +105,227 @@
                 });
             };
         }
+    }
+
+    // 课程材料弹窗中 .content 与类型编号的对应关系，与页面 comment 里“课程大纲、教学日历、教学概述”一致
+    const MATERIAL_TYPE_NAMES = { 1: '教学大纲', 2: '教学日历', 3: '教学概述' };
+
+    // 查不到材料时弹窗内容为空，这里补一段占位提示；
+    // 服务端还会给出失败原因（如 [ERR-998]-其他异常），作为次要信息一并显示
+    function renderMaterialPlaceholder($content, type, message) {
+        const wrapper = document.createElement('div');
+        wrapper.style.cssText = 'padding-top:150px;text-align:center;font-size:14px;color:#999;';
+
+        const main = document.createElement('div');
+        main.textContent = '该课程暂未提供' + (MATERIAL_TYPE_NAMES[type] || '课程材料');
+        wrapper.appendChild(main);
+
+        if (message) {
+            const hint = document.createElement('div');
+            hint.style.cssText = 'margin-top:12px;font-size:12px;color:#ccc;';
+            hint.textContent = '教务系统返回：' + message;
+            wrapper.appendChild(hint);
+        }
+
+        $content.empty().append(wrapper);
+    }
+
+    // 弹窗底部的下载按钮，只有当前这门课确实取到材料时才显示
+    const MATERIAL_DOWNLOAD_BUTTON_ID = 'materialDownloadBtn';
+    // 当前弹窗里的材料，供下载按钮取用；没有材料时置空，按钮随之隐藏
+    let currentMaterial = null;
+
+    // 从课程表格里反查课程名称，用于生成文件名。
+    // 培养计划页会把课程代码挂在课程名称链接的 data-course-code 上，优先取它；
+    // 各院系开课情况页只有裸表格，按“课程代码所在行的相邻单元格”推断
+    function findCourseName(courseCode) {
+        const code = String(courseCode || '');
+        if (!code) return '';
+
+        const linked = document.querySelector('[data-course-code="' + code + '"]');
+        if (linked) {
+            const name = linked.textContent.trim();
+            if (name) return name;
+        }
+
+        const isNumber = text => /^[\d.\s]+$/.test(text);
+        for (const row of document.querySelectorAll('table tbody tr')) {
+            // 弹窗里的材料本身也是表格，同样可能出现课程代码，不能从这里取名称
+            if (row.closest('#onlineView')) continue;
+
+            const cells = Array.from(row.querySelectorAll('td'));
+            const index = cells.findIndex(cell => cell.textContent.trim() === code);
+            if (index < 0) continue;
+
+            // 培养计划页是 课程类别/课程编号/课程名称，名称在编号之后；
+            // 开课情况页是 课程名称/课程编号/学分，编号之后是纯数字的学分，需要往前找
+            if (index >= 1 && cells[index + 1]) {
+                const after = cells[index + 1].textContent.trim();
+                if (after && !isNumber(after)) return after;
+            }
+            for (let i = index - 1; i >= 0; i--) {
+                const text = cells[i].textContent.trim();
+                if (text && !isNumber(text)) return text;
+            }
+        }
+        return '';
+    }
+
+    // 去掉文件名里的非法字符，避免下载时被浏览器或系统拒绝
+    function sanitizeFileName(text) {
+        return String(text || '').replace(/[\\/:*?"<>|\r\n\t]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 60);
+    }
+
+    function materialFileName(courseCode, type) {
+        return [findCourseName(courseCode), MATERIAL_TYPE_NAMES[type] || '课程材料', courseCode]
+            .map(sanitizeFileName)
+            .filter(part => part !== '')
+            .join('_') + '.doc';
+    }
+
+    // 材料是服务端由 Office 文档转换出的完整 HTML 文档，另存为 .doc 后 Word/WPS 会按文档打开并保留排版。
+    // 但转换结果里带着三类脏数据，原样落盘会出问题：
+    // 1. Word 系列声明的 charset 是 gb2312，而字节实际是 UTF-8，保存后打开就是乱码；
+    // 2. <link> 指向 xxx.files/filelist.xml 等 Word 元数据，服务端并不存在；
+    // 3. <img> 全部指向服务端没有的路径（/data/program/... 实测 404），Word 里会显示成红叉。
+    function buildMaterialDocFile(material, title) {
+        const doc = new DOMParser().parseFromString(String(material), 'text/html');
+
+        doc.querySelectorAll('link').forEach(node => node.remove());
+        doc.querySelectorAll('meta').forEach(node => {
+            const equiv = node.getAttribute('http-equiv') || '';
+            if (node.hasAttribute('charset') || /content-type/i.test(equiv)) node.remove();
+        });
+
+        doc.querySelectorAll('img').forEach(img => {
+            if (/^data:/i.test(img.getAttribute('src') || '')) return;
+            const placeholder = doc.createElement('span');
+            placeholder.textContent = '【图片缺失】';
+            placeholder.setAttribute('style', 'color:#999;');
+            img.replaceWith(placeholder);
+        });
+
+        // 声明放在 head 最前，同时补上 UTF-8 BOM，
+        // Word 判定本地 HTML 的编码以 BOM 为准，两者都给上可避免声明与字节不一致
+        const meta = doc.createElement('meta');
+        meta.setAttribute('charset', 'utf-8');
+        doc.head.insertBefore(meta, doc.head.firstChild);
+        doc.title = title;
+
+        return '\ufeff<!DOCTYPE html>\r\n' + doc.documentElement.outerHTML;
+    }
+
+    // 弹窗由页面自带（#onlineView 已在 HTML 里）时 addModal() 会直接返回，不会带上下载按钮，
+    // 所以这里按需把按钮补进弹窗底部，两种情况都能用；绑定也放在这里，避免按钮晚于初始化创建时漏绑
+    function ensureMaterialDownloadButton() {
+        const existing = document.getElementById(MATERIAL_DOWNLOAD_BUTTON_ID);
+        if (existing) {
+            if (existing.dataset.enhanced !== 'true') {
+                existing.dataset.enhanced = 'true';
+                existing.addEventListener('click', downloadMaterialDoc);
+            }
+            return existing;
+        }
+
+        const footer = document.querySelector('#onlineView .modal-footer');
+        if (!footer) return null;
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.id = MATERIAL_DOWNLOAD_BUTTON_ID;
+        button.className = 'btn green';
+        button.textContent = '下载为 Word 文档';
+        button.style.display = 'none';
+        footer.insertBefore(button, footer.firstChild);
+        return ensureMaterialDownloadButton();
+    }
+
+    function updateMaterialDownloadButton() {
+        const button = ensureMaterialDownloadButton();
+        if (!button) return;
+        button.style.display = currentMaterial ? '' : 'none';
+    }
+
+    function downloadMaterialDoc() {
+        if (!currentMaterial) return;
+
+        const blob = new Blob([buildMaterialDocFile(currentMaterial.html, currentMaterial.title)],
+            { type: 'application/msword' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = currentMaterial.fileName;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }
+
+    function enhanceMaterialDownload() {
+        if (ensureMaterialDownloadButton()) return;
+        // 个别页面晚于本轮初始化才渲染弹窗，等它出现再补按钮
+        waitForElement('#onlineView .modal-footer', ensureMaterialDownloadButton);
+    }
+
+    // 增强 $.viewCourseMaterial：原实现只在拿到材料时才写入内容，且没有清空与失败提示。
+    // 课程没有上传材料时后端返回的是 [{"msg":"[ERR-998]-其他异常","success":false}]，
+    // 结果被包在数组里，result.success 取到 undefined，!result.success 成立，
+    // 于是执行 $("#tagId .content").html(result.msg)，而 .html(undefined) 是空操作，
+    // 弹窗要么显示空白，要么残留上一门课程的材料。
+    // 这里改为请求前先清空内容，拿不到材料时给出占位提示，各类入口（页面自带的
+    // showCourseProp、培养计划页与班次列表里追加的链接）都经过该函数，无需逐个改动
+    function enhanceViewCourseMaterial() {
+        if (!$.viewCourseMaterial || $.viewCourseMaterial.enhanced) return;
+
+        $.viewCourseMaterial = function(options) {
+            const tagId = options.tagId;
+            const type = options.type ? options.type : 1;
+            const $modal = $('#' + tagId);
+            const $content = $('#' + tagId + ' .content');
+
+            const showModal = () => {
+                const modalWidth = $modal.width();
+                $modal.modal('show').css({ 'margin-left': '-' + parseInt(modalWidth) / 2 + 'px' });
+            };
+
+            // 上一次的材料先清空，否则查询失败时弹窗会残留上一门课程的内容
+            $content.empty();
+
+            $.ajax({
+                url: options.contextPath + '/course/onlineViewNewBySftp',
+                type: 'POST',
+                dataType: 'json',
+                data: { courseCode: options.courseCode, type: type },
+                success: function(result) {
+                    // 结果被包了一层数组即为失败，取不到 content 时同样按失败处理
+                    const material = (result && !Array.isArray(result) && result.success) ? result.content : '';
+                    if (material && String(material).trim() !== '') {
+                        $content.html(material);
+                        currentMaterial = {
+                            html: material,
+                            title: [findCourseName(options.courseCode),
+                                MATERIAL_TYPE_NAMES[type] || '课程材料',
+                                options.courseCode].filter(part => part).join(' '),
+                            fileName: materialFileName(options.courseCode, type)
+                        };
+                    } else {
+                        currentMaterial = null;
+                        renderMaterialPlaceholder($content, type,
+                            (result && !Array.isArray(result) && result.msg) || '');
+                    }
+                    updateMaterialDownloadButton();
+                    showModal();
+                },
+                error: function() {
+                    currentMaterial = null;
+                    updateMaterialDownloadButton();
+                    renderMaterialPlaceholder($content, type, '');
+                    showModal();
+                }
+            });
+        };
+
+        $.viewCourseMaterial.enhanced = true;
     }
 
     // 培养计划页面的课程表格：#tsCoursesTbl，课程行为
@@ -575,6 +797,8 @@
         addModal();
         addSwapCourseModal();
         defineShowCourseProp();
+        enhanceViewCourseMaterial();
+        enhanceMaterialDownload();
         addClassListTableStyle();
         installSubmitWatcher();
         removeNoticeButton();
