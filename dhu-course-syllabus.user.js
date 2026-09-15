@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      3.8
-// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有开课部门的课程 6. 兼容校外 webproxy 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课 11. 培养计划页面底部追加超星学习通自选课程入口 12. 教学大纲/教学日历无内容时给出占位提示 13. 教学大纲/教学日历弹窗内可下载为 Word 文档 14. 选课页面左上角追加可展开的课程表侧边栏，课表下方列出未设置上课时间的课程
+// @version      3.9
+// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有开课部门的课程 6. 兼容校外 webproxy 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课 11. 培养计划页面底部追加超星学习通自选课程入口 12. 教学大纲/教学日历无内容时给出占位提示 13. 教学大纲/教学日历弹窗内可下载为 Word 文档 14. 选课页面左上角追加可展开的课程表侧边栏，课表下方列出未设置上课时间的课程 15. 志愿型选课模式下，退课按钮同时支持撤销志愿课程
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
@@ -1412,9 +1412,21 @@
     // 冲突提示可能让用户等待、提交也可能迟迟不返回，靠这个延时兜底确认课程的最终状态
     const SWAP_SETTLE_DELAY = 20000;
 
-    // initSelCourses 返回本学期已选课程，其中 jxbdm 即当前已选班次的选课序号。
+    // initSelCourses 返回本学期选课记录，其中已录取课程的 jxbdm 即当前班次的选课序号。
     // 学生可能在别处退课，这里每次都重新查询，不做缓存
     let originalSelectSubmitRef = null;
+
+    // 退课接口 /selectcourse/cancelSC 靠 cancelType 区分两组课程，
+    // 取值与 toSSC 页面“已被录取课程组”和“第一次选课志愿课程组”的删除按钮一致
+    const CANCEL_TYPE_ENROLLED = 1;
+    const CANCEL_TYPE_VOLUNTEER = 2;
+
+    // 志愿型选课模式下，选课先落进志愿列表，选课关闭时才按名额分配，
+    // 因此 initSelCourses 会同时返回 enrollCourses（已录取）与 selectedCourses（志愿）。
+    // 两组课程要用不同的 cancelType 退课，这里合并成一份列表并带上来源
+    function taggedSelectedCourses(courses, cancelType) {
+        return (courses || []).map(course => Object.assign({}, course, { cancelType: cancelType }));
+    }
 
     function loadSelectedCourses() {
         return new Promise(resolve => {
@@ -1423,11 +1435,22 @@
                 type: 'POST',
                 dataType: 'json',
                 success: result => {
-                    resolve(result && result.success ? (result.enrollCourses || []) : null);
+                    if (!result || !result.success) {
+                        resolve(null);
+                        return;
+                    }
+
+                    resolve(taggedSelectedCourses(result.enrollCourses, CANCEL_TYPE_ENROLLED)
+                        .concat(taggedSelectedCourses(result.selectedCourses, CANCEL_TYPE_VOLUNTEER)));
                 },
                 error: () => resolve(null)
             });
         });
+    }
+
+    // 志愿尚未录取，撤销它不会释放名额；已录取的课程退课后名额会被他人占用
+    function isVolunteerCourse(course) {
+        return !!course && course.cancelType === CANCEL_TYPE_VOLUNTEER;
     }
 
     // 选课提交的参数由页面各自拼装（是否选教材、验证码、学科基础等各不相同），
@@ -1484,23 +1507,49 @@
         </div>`);
     }
 
+    // 志愿课程在 initSelCourses 里没有 jxbdm（选课序号），但班次列表已经列出了同一门课的
+    // 所有班次，可以按组班序号反查它的选课序号；班次列表没打开或已重建时返回 null
+    function classListCttId(classNo) {
+        const table = document.getElementById(CLASS_LIST_TABLE_ID);
+        const tbody = table && table.querySelector('tbody');
+        if (!tbody || classNo == null) return null;
+
+        const row = Array.from(tbody.children).find(
+            tr => tr.cells && tr.cells.length > 1 && tr.cells[1].textContent.trim() === String(classNo)
+        );
+        return row ? row.cells[0].textContent.trim() : null;
+    }
+
+    // 已录取的课程直接用 jxbdm，志愿课程只能靠组班序号到班次列表里反查
+    function selectedCourseCttId(course) {
+        if (!course) return null;
+        return course.jxbdm || classListCttId(course.classNo);
+    }
+
     // 退课后新班次可能已被占满，这一风险必须先告知用户
     function confirmSwapCourse(courseCode, enrolled) {
         return new Promise(resolve => {
+            const cttId = selectedCourseCttId(enrolled);
             const section = [
-                '选课序号 ' + enrolled.jxbdm,
+                cttId ? '选课序号 ' + cttId : '',
                 enrolled.classNo ? '班次 ' + enrolled.classNo : '',
                 enrolled.teachName,
                 enrolled.classTime1,
                 enrolled.classRoom1
             ].filter(Boolean).join('　');
 
+            // 志愿课程换课只是改投另一班次的志愿，没有“名额被占用”的风险
+            const tip = isVolunteerCourse(enrolled)
+                ? '<p style="margin:0;color:#e50112;">该课程尚未录取，撤销志愿不会释放名额，' +
+                  '志愿能否录取取决于选课结束时的名额分配。是否继续？</p>'
+                : '<p style="margin:0;color:#e50112;">若新班次名额在此期间已被他人占用，退课后将无法选中。' +
+                  '脚本会自动尝试重新选回原班次，但不保证一定成功，是否继续？</p>';
+
             document.getElementById('swapCourseMsg').innerHTML =
                 '<p style="margin:0 0 10px;">课程 <b>' + enrolled.courseName + '</b>（' + courseCode +
-                '）已经选上，换课会<b>先退掉当前班次</b>再选择新班次：</p>' +
-                '<p style="margin:0 0 10px;color:#31708f;">当前班次：' + section + '</p>' +
-                '<p style="margin:0;color:#e50112;">若新班次名额在此期间已被他人占用，退课后将无法选中。' +
-                '脚本会自动尝试重新选回原班次，但不保证一定成功，是否继续？</p>';
+                '）' + (isVolunteerCourse(enrolled) ? '已在志愿列表中' : '已经选上') + '，换课会' +
+                (isVolunteerCourse(enrolled) ? '<b>先撤销当前志愿</b>再提交新班次' : '<b>先退掉当前班次</b>再选择新班次') + '：</p>' +
+                '<p style="margin:0 0 10px;color:#31708f;">当前班次：' + section + '</p>' + tip;
 
             const field = document.getElementById('swapCourseFld');
             const okButton = document.getElementById('swapCourseOk');
@@ -1535,28 +1584,25 @@
         });
     }
 
-    // 退掉当前已选班次，与 toSSC 页面“删除”按钮使用同一接口
-    function dropSelectedSection(courseCode, classNo) {
+    // 退掉当前班次，与 toSSC 页面“删除”按钮使用同一接口。
+    // 志愿型选课模式下，志愿列表要靠 cancelType 2 才能撤销，传错就退不掉
+    function dropSelectedSection(courseCode, classNo, cancelType) {
         return new Promise(resolve => {
             $.ajax({
                 url: contextPath + '/selectcourse/cancelSC',
                 type: 'POST',
                 dataType: 'json',
-                data: { courseCode: courseCode, classNo: classNo, cancelType: 1 },
+                data: { courseCode: courseCode, classNo: classNo, cancelType: cancelType },
                 success: result => resolve(result || { success: false, msg: '退课未返回结果' }),
                 error: () => resolve({ success: false, msg: '退课请求失败，请刷新页面后重试' })
             });
         });
     }
 
-    // 培养计划页面上的“退课”：培养计划表格里没有班次信息，
-    // 需要先按课程编号到本学期已选课程里查到班次号，再走与 toSSC 删除按钮相同的接口。
-    // 退课会释放名额且可能被他人占用，因此先让用户确认
+    // 培养计划页面上的“退课”：培养计划表格里没有班次信息，需要先按课程编号到本学期
+    // 选课记录里查到班次号与课程来源，再走与 toSSC 删除按钮相同的接口。
+    // 由于两种来源的后果不同，确认文案也要等查到记录后再按来源区分
     function dropEnrolledCourse(courseCode, courseName, link) {
-        if (!confirm('确认退掉“' + courseName + '”吗？\r\r退课后该班次的名额会被释放，可能被他人占用，需要重新选课才能恢复。')) {
-            return;
-        }
-
         link.textContent = '退课中...';
         link.style.color = '#999';
         link.style.pointerEvents = 'none';
@@ -1567,6 +1613,10 @@
             link.style.color = '#0066cc';
             link.style.pointerEvents = '';
         };
+
+        const confirmDrop = course => confirm(isVolunteerCourse(course)
+            ? '确认撤销“' + courseName + '”的志愿吗？\r\r该课程尚未录取，撤销志愿不会释放名额，重新选课即可恢复志愿。'
+            : '确认退掉“' + courseName + '”吗？\r\r退课后该班次的名额会被释放，可能被他人占用，需要重新选课才能恢复。');
 
         loadSelectedCourses().then(courses => {
             if (!courses) {
@@ -1580,13 +1630,24 @@
                 return;
             }
 
-            dropSelectedSection(courseCode, enrolled.classNo).then(result => {
+            // toSSC 页面对 allowSC 不为 1 的课程同样不显示删除按钮
+            if (String(enrolled.allowSC) !== '1') {
+                restore('该课程当前不允许退课。');
+                return;
+            }
+
+            if (!confirmDrop(enrolled)) {
+                restore();
+                return;
+            }
+
+            dropSelectedSection(courseCode, enrolled.classNo, enrolled.cancelType).then(result => {
                 if (!result.success) {
                     restore('退课失败：' + (result.msg || '未知错误'));
                     return;
                 }
 
-                alert('退课成功！');
+                alert(isVolunteerCourse(enrolled) ? '已撤销志愿！' : '退课成功！');
                 // 培养计划表格不会自行更新，这里就地清掉该课程所在学期列的“已选”
                 link.parentNode.textContent = '';
                 refreshOtherCoursesSection();
@@ -1613,9 +1674,11 @@
     // 已经提交过一次的话，页面可能已重建班次列表，只能沿用刚才的提交参数；
     // 否则班次列表还是原样，交给页面自己的提交逻辑去拼装参数
     function restoreOriginalSection(aNode, enrolled, requestData, doSubmit) {
+        // 志愿课程没有 jxbdm，需要用组班序号到班次列表里反查原班次的选课序号
+        const cttId = selectedCourseCttId(enrolled);
         const report = restored => {
             alert(restored
-                ? '换课失败，已自动重新选回原班次（选课序号 ' + enrolled.jxbdm + '）。'
+                ? '换课失败，已自动重新选回原班次（选课序号 ' + cttId + '）。'
                 : '换课失败，且未能重新选回原班次，请立即手动重新选课！');
 
             // 页面上的课程列表还停留在退课后的状态，重新拉取一次
@@ -1625,16 +1688,22 @@
             }
         };
 
+        // 反查不到原班次的选课序号就无法自动选回，只能让用户手动处理
+        if (!cttId) {
+            report(false);
+            return;
+        }
+
         if (!requestData && aNode && document.body.contains(aNode) && typeof doSubmit === 'function') {
-            submitNewSection(aNode, enrolled.jxbdm, doSubmit, false).then(({ result }) => {
+            submitNewSection(aNode, cttId, doSubmit, false).then(({ result }) => {
                 report(result && result.success && !isCaptchaRequired(result));
             });
             return;
         }
 
         const baseData = requestData && typeof requestData === 'object'
-            ? $.extend({}, requestData, { cttId: enrolled.jxbdm })
-            : { cttId: enrolled.jxbdm, needMaterial: false, capCode: '' };
+            ? $.extend({}, requestData, { cttId: cttId })
+            : { cttId: cttId, needMaterial: false, capCode: '' };
 
         const attempt = capCode => $.ajax({
             url: contextPath + '/selectcourse/scSubmit',
@@ -1702,7 +1771,7 @@
                 confirmConflictWarning(conflictResult).then(proceed => {
                     if (!proceed) return;
 
-                    dropSelectedSection(courseCode, enrolled.classNo).then(dropResult => {
+                    dropSelectedSection(courseCode, enrolled.classNo, enrolled.cancelType).then(dropResult => {
                         if (!dropResult.success) {
                             alert('退课失败：' + (dropResult.msg || '未知错误') + '，已取消换课。');
                             return;
@@ -1756,11 +1825,14 @@
                     return;
                 }
 
-                if (String(enrolled.jxbdm) === String(cttId)) {
-                    alert('该班次就是当前已选班次，无需换课。');
+                // 志愿课程的选课序号要靠班次列表反查，查不到就不能认定是同一班次
+                const enrolledCttId = selectedCourseCttId(enrolled);
+                if (enrolledCttId && String(enrolledCttId) === String(cttId)) {
+                    alert(isVolunteerCourse(enrolled)
+                        ? '该班次已经在你的志愿列表中，无需换课。'
+                        : '该班次就是当前已选班次，无需换课。');
                     return;
                 }
-
                 // 各页面的提交函数都叫 doSelectSubmit，用它可复用各自的参数拼装
                 swapCourseSection(aNode, cttId, enrolled, courseCode, pageWindow.doSelectSubmit);
             });
