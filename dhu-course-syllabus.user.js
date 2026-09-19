@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         东华大学本科教务管理系统选课显示增强
 // @namespace    http://tampermonkey.net/
-// @version      3.9
-// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有开课部门的课程 6. 兼容校外 webproxy 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课 11. 培养计划页面底部追加超星学习通自选课程入口 12. 教学大纲/教学日历无内容时给出占位提示 13. 教学大纲/教学日历弹窗内可下载为 Word 文档 14. 选课页面左上角追加可展开的课程表侧边栏，课表下方列出未设置上课时间的课程 15. 志愿型选课模式下，退课按钮同时支持撤销志愿课程
+// @version      3.10
+// @description  1. 培养计划页面追加教学大纲/教学日历按钮，班次列表统一由课程名称进入 2. 选课手册显示最新版本(2019-2026级) 3. 已修/已选/已通过课程可查看班次列表 4. 移除首页浮动的评教指南 5. “全校”选项可汇总显示所有开课部门的课程 6. 兼容校外 webproxy 代理访问 7. 简化文化素质类课程数量提示 8. 已选课程支持在班次列表内直接换课 9. 培养计划页面可展开查看不计入总学分的其它课程 10. 培养计划页面的“已选”可点击退课 11. 培养计划页面底部追加超星学习通自选课程入口 12. 教学大纲/教学日历无内容时给出占位提示 13. 教学大纲/教学日历弹窗内可下载为 Word 文档 14. 选课页面左上角追加可展开的课程表侧边栏，课表下方列出未设置上课时间的课程 15. 志愿型选课模式下，退课按钮同时支持撤销志愿课程 16. 培养计划页面的“未读”课程若本次可选，在当前选课学期列标记“可选”
 // @author       NullWinters
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSH*
 // @match        https://jwgl.dhu.edu.cn/dhu/selectcourse/toSCC*
@@ -15,7 +15,7 @@
 // @run-at       document-idle
 // ==/UserScript==
 
-(function() {
+(function () {
     'use strict';
 
     const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -96,7 +96,7 @@
     // 定义 showCourseProp 函数
     function defineShowCourseProp() {
         if (typeof pageWindow.showCourseProp !== 'function') {
-            pageWindow.showCourseProp = function(courseCode, type) {
+            pageWindow.showCourseProp = function (courseCode, type) {
                 $.viewCourseMaterial({
                     courseCode: courseCode,
                     type: type,
@@ -277,7 +277,7 @@
     function enhanceViewCourseMaterial() {
         if (!$.viewCourseMaterial || $.viewCourseMaterial.enhanced) return;
 
-        $.viewCourseMaterial = function(options) {
+        $.viewCourseMaterial = function (options) {
             const tagId = options.tagId;
             const type = options.type ? options.type : 1;
             const $modal = $('#' + tagId);
@@ -296,7 +296,7 @@
                 type: 'POST',
                 dataType: 'json',
                 data: { courseCode: options.courseCode, type: type },
-                success: function(result) {
+                success: function (result) {
                     // 结果被包了一层数组即为失败，取不到 content 时同样按失败处理
                     const material = (result && !Array.isArray(result) && result.success) ? result.content : '';
                     if (material && String(material).trim() !== '') {
@@ -304,8 +304,8 @@
                         currentMaterial = {
                             html: material,
                             title: [findCourseName(options.courseCode),
-                                MATERIAL_TYPE_NAMES[type] || '课程材料',
-                                options.courseCode].filter(part => part).join(' '),
+                            MATERIAL_TYPE_NAMES[type] || '课程材料',
+                            options.courseCode].filter(part => part).join(' '),
                             fileName: materialFileName(options.courseCode, type)
                         };
                     } else {
@@ -316,7 +316,7 @@
                     updateMaterialDownloadButton();
                     showModal();
                 },
-                error: function() {
+                error: function () {
                     currentMaterial = null;
                     updateMaterialDownloadButton();
                     renderMaterialPlaceholder($content, type, '');
@@ -461,6 +461,112 @@
         });
     }
 
+    // 表格里标着“未读”的课程还没修读，其中一部分本次选课就开放。
+    // 当前选课学期所在列由服务端以上底色（#eaf1f1）标出，列位置会随表格列数变化
+    // （本脚本追加的教学大纲、教学日历两列也会影响），因此运行时从数据行探测，不写死列号
+    const CURRENT_TERM_TINT = 'eaf1f1';
+    const PLAN_UNREAD_MARK = '未读';
+    const PLAN_SELECTABLE_MARK = '可选';
+
+    // accessJudge 的判定只取决于课程与当前选课轮次，同一课程不必重复查询
+    const courseAccessCache = new Map();
+
+    // 带底色单元格出现次数最多的那一列即当前选课学期列。
+    // 分类标题行、其它课程行都不含底色，不影响统计
+    function currentTermColumnIndex(table) {
+        const counts = new Map();
+        Array.from(table.tBodies).forEach(tbody => {
+            Array.from(tbody.rows).forEach(row => {
+                Array.from(row.cells).forEach(cell => {
+                    if ((cell.getAttribute('style') || '').indexOf(CURRENT_TERM_TINT) === -1) return;
+                    counts.set(cell.cellIndex, (counts.get(cell.cellIndex) || 0) + 1);
+                });
+            });
+        });
+
+        let columnIndex = -1;
+        let maxCount = 0;
+        counts.forEach((count, cellIndex) => {
+            if (count <= maxCount) return;
+            maxCount = count;
+            columnIndex = cellIndex;
+        });
+        return columnIndex;
+    }
+
+    // 课程本次是否开放选课：accessJudge 返回 success 即为开放，
+    // 不开放时接口会给出原因（如“该课程没有开放选课”）
+    function queryCourseAccess(courseCode) {
+        const cached = courseAccessCache.get(courseCode);
+        if (cached !== undefined) return Promise.resolve(cached);
+
+        return new Promise(resolve => {
+            $.ajax({
+                url: pageWindow.contextPath + '/selectcourse/accessJudge',
+                type: 'POST',
+                dataType: 'json',
+                data: { courseCode: courseCode },
+                success: result => {
+                    const selectable = !!(result && result.success);
+                    courseAccessCache.set(courseCode, selectable);
+                    resolve(selectable);
+                },
+                // 查询失败按不可选处理并保留“未读”，宁可漏标也不要误标
+                error: () => resolve(false)
+            });
+        });
+    }
+
+    // 未读课程若本次可选，就把标记挪到当前选课学期列显示为“可选”，并清掉原来学期列的“未读”。
+    // “未读”标示的是计划修读的学期，与本次能否选课无关，选中后由当前学期的标记来提示，
+    // 因此只清空单元格文本而不删除单元格，避免后面的列整体左移
+    function enhanceUnreadCourses(table) {
+        const termColumn = currentTermColumnIndex(table);
+        if (termColumn < 0) return;
+
+        Array.from(table.tBodies).forEach(tbody => {
+            Array.from(tbody.rows).forEach(row => {
+                // 表格内容会被 selecthome.js 重新渲染，新行没有标记，因此每次都要重新判断；
+                // 查询结果有缓存，重复处理不会产生额外请求
+                if (row.dataset.planAccessEnhanced === 'true') return;
+
+                const cells = Array.from(row.cells);
+                if (cells.length < 3) return;
+
+                const unreadCell = cells.find(cell => cell.textContent.trim() === PLAN_UNREAD_MARK);
+                const termCell = row.cells[termColumn];
+                if (!unreadCell || !termCell) return;
+
+                const courseCode = cells[1].textContent.trim();
+                const courseName = cells[2].textContent.trim();
+                if (!/^\d+$/.test(courseCode) || !courseName) return;
+
+                row.dataset.planAccessEnhanced = 'true';
+                queryCourseAccess(courseCode).then(selectable => {
+                    if (!selectable) return;
+                    // 请求期间课程可能已被选上、退掉或表格已重绘，确认两个单元格仍是原样再写入
+                    if (unreadCell.textContent.trim() !== PLAN_UNREAD_MARK) return;
+                    // “未读”可能本来就落在当前学期列上，此时该单元格就是未读单元格，无需再判空
+                    if (termCell !== unreadCell && termCell.textContent.trim() !== '') return;
+
+                    unreadCell.textContent = '';
+                    termCell.textContent = '';
+
+                    const link = document.createElement('a');
+                    link.textContent = PLAN_SELECTABLE_MARK;
+                    link.title = '该课程本次可选，点击查看班次列表';
+                    link.style.cursor = 'pointer';
+                    link.style.color = '#3c9d3c';
+                    link.style.textDecoration = 'none';
+                    // selectScope 优先读链接上的课程代码，这样链接文本可以自由改写
+                    link.dataset.courseCode = courseCode;
+                    link.addEventListener('click', () => pageWindow.selectScope(link));
+                    termCell.appendChild(link);
+                });
+            });
+        });
+    }
+
     // 单元格默认左对齐，此处统一居中
     function addPlanTableStyle() {
         if (document.getElementById('planTableStyle')) return;
@@ -508,6 +614,8 @@
         });
 
         enhanceEnrolledMarks(table);
+        // 必须在课程行追加完教学大纲、教学日历两列之后执行，否则探测到的学期列号会偏移两格
+        enhanceUnreadCourses(table);
         syncPlanRowColspans(table);
     }
 
@@ -597,7 +705,7 @@
     // 查询只做一次，失败时允许后续重试
     let otherCoursesState = 'idle';
     // 展开状态下其它课程行需要重绘，由 buildOtherCoursesToggle 写入
-    let refreshOtherCoursesSection = () => {};
+    let refreshOtherCoursesSection = () => { };
 
     function queryOtherCourses(onSuccess, onError) {
         $.ajax({
@@ -992,14 +1100,14 @@
             type: 'POST',
             dataType: 'json',
             data: { yearTermId: term.id, yearTermName: term.name },
-            success: function(result) {
+            success: function (result) {
                 if (!result || !result.success || !result.content) {
                     showCourseTableMessage('课程表加载失败' + (result && result.msg ? '：' + result.msg : ''));
                     return;
                 }
                 renderCourseTable(term, result);
             },
-            error: function() {
+            error: function () {
                 showCourseTableMessage('课程表加载失败，请稍后重试。');
             }
         });
@@ -1038,7 +1146,7 @@
             type: 'POST',
             dataType: 'json',
             data: { ordered: true, sortType: 'desc' },
-            success: function(result) {
+            success: function (result) {
                 if (!result || !result.success || !result.semesterSS || !result.semesterSS.length) {
                     showCourseTableMessage('学期列表加载失败' + (result && result.msg ? '：' + result.msg : ''));
                     return;
@@ -1053,7 +1161,7 @@
                     showCourseTableMessage('未找到可用的学期。');
                 }
             },
-            error: function() {
+            error: function () {
                 showCourseTableMessage('学期列表加载失败，请稍后重试。');
             }
         });
@@ -1214,7 +1322,7 @@
     function fetchLatestHandbooks(callback) {
         // 先请求第一页获取总页数
         fetchExternalText('https://jw.dhu.edu.cn/9960/list1.htm',
-            function(html) {
+            function (html) {
                 const totalPages = getTotalPages(html);
                 const firstPageHandbooks = parseHandbooksFromHTML(html);
 
@@ -1234,7 +1342,7 @@
 
                 remainingPages.forEach(pageNum => {
                     fetchExternalText(`https://jw.dhu.edu.cn/9960/list${pageNum}.htm`,
-                        function(html) {
+                        function (html) {
                             const pageHandbooks = parseHandbooksFromHTML(html);
                             allHandbooks.push(...pageHandbooks);
                             completed++;
@@ -1253,7 +1361,7 @@
                                 callback(uniqueHandbooks);
                             }
                         },
-                        function() {
+                        function () {
                             completed++;
                             if (completed === remainingPages.length) {
                                 allHandbooks.sort((a, b) => parseInt(b.year) - parseInt(a.year));
@@ -1263,7 +1371,7 @@
                     );
                 });
             },
-            function() {
+            function () {
                 console.error('获取选课手册失败');
                 callback([]);
             }
@@ -1275,13 +1383,13 @@
         const originalShowScmTbl = pageWindow.showScmTbl;
         if (!originalShowScmTbl || pageWindow.showScmTblEnhanced) return;
 
-        pageWindow.showScmTbl = function() {
+        pageWindow.showScmTbl = function () {
             // 先调用原函数显示侧边栏
             originalShowScmTbl.call(pageWindow);
 
             // 延迟获取最新手册并替换内容（等待原函数加载完成）
-            setTimeout(function() {
-                fetchLatestHandbooks(function(handbooks) {
+            setTimeout(function () {
+                fetchLatestHandbooks(function (handbooks) {
                     if (handbooks.length === 0) return;
 
                     const scmList = document.getElementById('scmList');
@@ -1291,7 +1399,7 @@
                     scmList.innerHTML = '';
 
                     // 添加新的手册链接
-                    handbooks.forEach(function(handbook) {
+                    handbooks.forEach(function (handbook) {
                         const btnGroup = document.createElement('div');
                         btnGroup.className = 'btn-group';
                         btnGroup.style.marginBottom = '0px !important';
@@ -1332,9 +1440,9 @@
             sitePath().endsWith(page)
         );
 
-        pageWindow.selectScope = function(aNode) {
+        pageWindow.selectScope = function (aNode) {
             closeFailureMsg();
-            
+
             const $aNode = $(aNode);
 
             // 根据页面类型获取课程代码
@@ -1361,7 +1469,7 @@
                 dataType: 'json',
                 data: { courseCode: courseCode },
                 async: false,
-                success: function(result) {
+                success: function (result) {
                     if (result.success) {
                         // 原有逻辑：有权限时正常打开
                         if (result.warnings && 0 < result.warnings.length) {
@@ -1376,11 +1484,11 @@
                     } else {
                         // 增强逻辑：无权限时（已修/已选/已通过），仍尝试打开班次列表
                         const errorMsg = result.msg || '';
-                        const isAlreadyTaken = errorMsg.includes('已经选了') || 
-                                               errorMsg.includes('已修') || 
-                                               errorMsg.includes('已选') ||
-                                               errorMsg.includes('已经通过了');
-                        
+                        const isAlreadyTaken = errorMsg.includes('已经选了') ||
+                            errorMsg.includes('已修') ||
+                            errorMsg.includes('已选') ||
+                            errorMsg.includes('已经通过了');
+
                         if (isAlreadyTaken) {
                             // 显示提示信息
                             $('#warnMsg').html('<i class="icon-warning-sign"></i>' + errorMsg);
@@ -1396,7 +1504,7 @@
                         }
                     }
                 },
-                error: function() {
+                error: function () {
                     alert('');
                 }
             });
@@ -1461,7 +1569,7 @@
         if (!$.ajax || $.ajax.watchScSubmit) return;
 
         const originalAjax = $.ajax;
-        const wrappedAjax = function(options) {
+        const wrappedAjax = function (options) {
             const url = options && typeof options.url === 'string' ? options.url : '';
             if (!submitWatcher || url.indexOf('/selectcourse/scSubmit') === -1) {
                 return originalAjax.apply(this, arguments);
@@ -1473,11 +1581,11 @@
             const originalError = options.error;
 
             return originalAjax.call(this, $.extend({}, options, {
-                success: function(result) {
+                success: function (result) {
                     if (originalSuccess) originalSuccess.apply(this, arguments);
                     watcher(options.data, result);
                 },
-                error: function() {
+                error: function () {
                     if (originalError) originalError.apply(this, arguments);
                     watcher(options.data, null);
                 }
@@ -1541,9 +1649,9 @@
             // 志愿课程换课只是改投另一班次的志愿，没有“名额被占用”的风险
             const tip = isVolunteerCourse(enrolled)
                 ? '<p style="margin:0;color:#e50112;">该课程尚未录取，撤销志愿不会释放名额，' +
-                  '志愿能否录取取决于选课结束时的名额分配。是否继续？</p>'
+                '志愿能否录取取决于选课结束时的名额分配。是否继续？</p>'
                 : '<p style="margin:0;color:#e50112;">若新班次名额在此期间已被他人占用，退课后将无法选中。' +
-                  '脚本会自动尝试重新选回原班次，但不保证一定成功，是否继续？</p>';
+                '脚本会自动尝试重新选回原班次，但不保证一定成功，是否继续？</p>';
 
             document.getElementById('swapCourseMsg').innerHTML =
                 '<p style="margin:0 0 10px;">课程 <b>' + enrolled.courseName + '</b>（' + courseCode +
@@ -1812,7 +1920,7 @@
         const originalSelectSubmit = pageWindow.selectSubmit;
         originalSelectSubmitRef = originalSelectSubmit;
 
-        pageWindow.selectSubmit = function(aNode, cttId) {
+        pageWindow.selectSubmit = function (aNode, cttId) {
             const courseCode = currentClassListCourseCode();
 
             loadSelectedCourses().then(courses => {
@@ -1854,10 +1962,10 @@
                 type: 'POST',
                 dataType: 'json',
                 data: { orgnId: orgnId },
-                success: function(result) {
+                success: function (result) {
                     resolve(result);
                 },
-                error: function() {
+                error: function () {
                     if (!silent) alert('');
                     resolve(null);
                 }
@@ -1876,7 +1984,7 @@
                 type: 'POST',
                 dataType: 'json',
                 data: { ordered: false, sortType: 'asc', isAcademy: 0 },
-                success: function(result) {
+                success: function (result) {
                     if (!result.success || !result.orgnSS) {
                         resolve(null);
                         return;
@@ -1884,7 +1992,7 @@
                     resolve(result.orgnSS.map(orgn => String(orgn.id))
                         .filter(id => id !== '' && id !== ALL_SCHOOL_ORGN_ID));
                 },
-                error: function() {
+                error: function () {
                     resolve(null);
                 }
             });
@@ -1962,7 +2070,7 @@
     function enhanceInitOrgnCourse() {
         if (!pageWindow.initOrgnCourse || pageWindow.initOrgnCourseEnhanced) return;
 
-        pageWindow.initOrgnCourse = async function() {
+        pageWindow.initOrgnCourse = async function () {
             const orgnId = $('#asOrgn').val();
 
             if (orgnId === ALL_SCHOOL_ORGN_ID) {
